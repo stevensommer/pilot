@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -223,6 +224,137 @@ func (g *GitOperations) SwitchBranch(ctx context.Context, branchName string) err
 	return nil
 }
 
+// CommitIdentity holds the git identity and signing configuration resolved
+// from a project's own git config (see resolveCommitIdentity). Commit passes
+// these explicitly as `-c` overrides on the commit invocation instead of
+// relying on whatever the commit subprocess would otherwise inherit
+// ambiently (environment variables, a differently-resolved HOME, etc.) —
+// see GH incident where a fallback WIP commit landed as author "Work" with
+// an unverifiable signature while ordinary commits in the same execution
+// resolved correctly.
+type CommitIdentity struct {
+	// Name is user.name.
+	Name string
+	// Email is user.email.
+	Email string
+	// SigningKey is user.signingkey. May be empty even when GPGSign is true
+	// (git/gpg will then fall back to its own default-key resolution).
+	SigningKey string
+	// GPGSign is whether commit.gpgsign resolved true.
+	GPGSign bool
+}
+
+// ErrSigningFailed distinguishes a signing-specific commit failure — signing
+// was enabled (commit.gpgsign=true) but the underlying `git commit`
+// invocation failed, e.g. because gpg/pinentry is unreachable in this
+// execution context — from an ordinary commit failure. Git's commit is
+// all-or-nothing under `-c commit.gpgsign=true`: a signing failure aborts
+// the commit entirely, so no unsigned commit is ever left behind. Callers
+// (e.g. preserveDirtyWorktreeAsWIP) use errors.Is against this sentinel to
+// fail closed — falling back to the recovery-ref path — rather than
+// treating a signing failure like a generic, ignorable commit error.
+var ErrSigningFailed = errors.New("commit failed with signing enabled")
+
+// resolveCommitIdentity reads user.name, user.email, user.signingkey, and
+// commit.gpgsign via `git config --get`, scoped to projectPath (the
+// project's own checkout, not an ephemeral executor worktree — though in
+// practice a git worktree shares its parent's config, this makes the source
+// of truth explicit rather than incidental). An unset key is not an error:
+// `git config --get` exits 1 with empty output when a key isn't configured,
+// which resolves to a zero value (empty string / false) here. Only
+// unexpected git failures are surfaced as errors.
+func resolveCommitIdentity(ctx context.Context, projectPath string) (CommitIdentity, error) {
+	var identity CommitIdentity
+
+	name, err := gitConfigGet(ctx, projectPath, "user.name")
+	if err != nil {
+		return CommitIdentity{}, err
+	}
+	identity.Name = name
+
+	email, err := gitConfigGet(ctx, projectPath, "user.email")
+	if err != nil {
+		return CommitIdentity{}, err
+	}
+	identity.Email = email
+
+	signingKey, err := gitConfigGet(ctx, projectPath, "user.signingkey")
+	if err != nil {
+		return CommitIdentity{}, err
+	}
+	identity.SigningKey = signingKey
+
+	gpgSignRaw, err := gitConfigGet(ctx, projectPath, "commit.gpgsign")
+	if err != nil {
+		return CommitIdentity{}, err
+	}
+	identity.GPGSign = strings.EqualFold(strings.TrimSpace(gpgSignRaw), "true")
+
+	return identity, nil
+}
+
+// gitConfigGet runs `git config --get <key>` scoped to dir and returns the
+// trimmed value. An unset key (exit code 1, no output) is reported as ""
+// with a nil error — that is git config's normal way of saying "not
+// configured," not a failure. Any other error (e.g. dir isn't a git repo)
+// is surfaced.
+func gitConfigGet(ctx context.Context, dir, key string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "config", "--get", key)
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to read git config %s: %w", key, err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// gitIdentityEnvVars are the environment variables git's identity
+// resolution (ident.c) checks *before* falling back to user.name/user.email
+// config — including config supplied via `-c` on the same invocation. Any
+// of these left over from the calling process's ambient environment would
+// silently take precedence over the explicitly resolved CommitIdentity, so
+// commitIdentityEnv strips them before setting its own.
+var gitIdentityEnvVars = []string{
+	"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+	"GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+}
+
+// commitIdentityEnv builds the environment for the commit subprocess: the
+// current process's environment with any pre-existing
+// GIT_AUTHOR_*/GIT_COMMITTER_* entries removed, then re-added from the
+// resolved identity (when non-empty). This guarantees the commit's
+// author/committer identity is exactly what resolveCommitIdentity read from
+// the project's own git config — never a value leaked in from whatever
+// environment the executor's own process happens to be running under.
+func commitIdentityEnv(identity CommitIdentity) []string {
+	ambient := os.Environ()
+	env := make([]string, 0, len(ambient)+4)
+	for _, kv := range ambient {
+		key, _, _ := strings.Cut(kv, "=")
+		skip := false
+		for _, blocked := range gitIdentityEnvVars {
+			if key == blocked {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			env = append(env, kv)
+		}
+	}
+	if identity.Name != "" {
+		env = append(env, "GIT_AUTHOR_NAME="+identity.Name, "GIT_COMMITTER_NAME="+identity.Name)
+	}
+	if identity.Email != "" {
+		env = append(env, "GIT_AUTHOR_EMAIL="+identity.Email, "GIT_COMMITTER_EMAIL="+identity.Email)
+	}
+	return env
+}
+
 // Commit stages filtered changes and commits. Files matching defaultExcludeDirs
 // or defaultExcludeGlobs are never auto-staged. Returns ErrNoStageableChanges
 // (wrapped) when all dirty paths are excluded.
@@ -262,10 +394,54 @@ func (g *GitOperations) Commit(ctx context.Context, message string) (string, err
 		return "", fmt.Errorf("failed to stage changes: %w: %s", err, output)
 	}
 
-	// Commit
-	commitCmd := exec.CommandContext(ctx, "git", "commit", "-m", message)
+	// Resolve the project's real git identity explicitly once, rather than
+	// letting the commit subprocess resolve it ambiently.
+	identity, identErr := resolveCommitIdentity(ctx, g.projectPath)
+	if identErr != nil {
+		return "", fmt.Errorf("failed to resolve commit identity: %w", identErr)
+	}
+
+	// Commit — explicit -c overrides so the resolved identity/signing config
+	// is what actually gets used, regardless of what the subprocess would
+	// otherwise inherit. commit.gpgsign is always passed explicitly (true or
+	// false) so an ambiently-inherited value can never silently flip signing
+	// on or off from what the project's own config resolved to.
+	commitArgs := []string{}
+	if identity.Name != "" {
+		commitArgs = append(commitArgs, "-c", "user.name="+identity.Name)
+	}
+	if identity.Email != "" {
+		commitArgs = append(commitArgs, "-c", "user.email="+identity.Email)
+	}
+	commitArgs = append(commitArgs, "-c", fmt.Sprintf("commit.gpgsign=%t", identity.GPGSign))
+	if identity.SigningKey != "" {
+		commitArgs = append(commitArgs, "-c", "user.signingkey="+identity.SigningKey)
+	}
+	commitArgs = append(commitArgs, "commit", "-m", message)
+
+	commitCmd := exec.CommandContext(ctx, "git", commitArgs...)
 	commitCmd.Dir = g.projectPath
+	// GIT_AUTHOR_NAME/EMAIL and GIT_COMMITTER_NAME/EMAIL take precedence
+	// over user.name/user.email *even when the latter are set via -c* — git
+	// checks these environment variables before config when resolving
+	// identity. Verified empirically: an ambiently-inherited GIT_AUTHOR_NAME
+	// silently wins over "-c user.name=..." otherwise, which is exactly how
+	// a commit can land attributed to whatever the executor process's
+	// environment happens to carry (e.g. "Work") despite the project's own
+	// git config resolving correctly. Strip any inherited values and set
+	// them explicitly from the resolved identity so the subprocess's
+	// ambient environment can never override it.
+	commitCmd.Env = commitIdentityEnv(identity)
 	if output, err := commitCmd.CombinedOutput(); err != nil {
+		if identity.GPGSign {
+			// Git's commit is all-or-nothing under -c commit.gpgsign=true: a
+			// signing failure (gpg/pinentry unreachable, bad signingkey,
+			// etc.) aborts the commit entirely rather than leaving an
+			// unsigned commit behind. Surface this as a distinct,
+			// identifiable error so callers can fail closed instead of
+			// treating it like any other commit failure.
+			return "", fmt.Errorf("%w: %v: %s", ErrSigningFailed, err, output)
+		}
 		return "", fmt.Errorf("failed to commit: %w: %s", err, output)
 	}
 
