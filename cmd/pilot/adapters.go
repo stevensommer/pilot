@@ -241,14 +241,22 @@ func newProjectQualityCheckerFactory(cfg *config.Config) func(taskID, taskProjec
 // internal/comms — see internal/executor/contract_evidence.go's package doc),
 // so ContractDependency is duplicated there as an executor-local mirror.
 // This function is the one place that bridges the two shapes (GH-5013): it
-// resolves the task's project via cfg.FindProjectByPath and translates each
-// config.ContractDependency into its executor.ContractDependency twin. A
-// project with no `contract_dependencies` configured (or no matching
+// resolves the task's project via projectPathResolver.find and translates
+// each config.ContractDependency into its executor.ContractDependency twin.
+// A project with no `contract_dependencies` configured (or no matching
 // project) yields an empty slice — the Contract Evidence gate (GH-5009)
 // treats that as a complete no-op, per its first acceptance criterion.
+//
+// taskProjectPath is the task's execution path, which under the default
+// (use_worktree: true) mode is an ephemeral worktree, not the project's
+// configured checkout path — the same worktree-blindness GH-3716 fixed for
+// newProjectQualityCheckerFactory above. A raw cfg.FindProjectByPath lookup
+// here silently degraded the Contract Evidence gate to a no-op for every
+// worktree execution, so this uses the same projectPathResolver.
 func newProjectContractDependencyLookup(cfg *config.Config) executor.ContractDependencyLookup {
+	resolver := newProjectPathResolver(cfg)
 	return func(taskProjectPath string) []executor.ContractDependency {
-		proj := cfg.FindProjectByPath(taskProjectPath)
+		proj := resolver.find(taskProjectPath)
 		if proj == nil || len(proj.ContractDependencies) == 0 {
 			return nil
 		}

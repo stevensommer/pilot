@@ -918,6 +918,95 @@ func TestNewProjectContractDependencyLookup_NoOpWhenUnconfigured(t *testing.T) {
 	}
 }
 
+// TestNewProjectContractDependencyLookup_ResolvesAcrossWorktree mirrors
+// TestNewProjectQualityCheckerFactory_ResolvesAcrossWorktree: dispatching a
+// task in an ephemeral worktree (Pilot's default use_worktree: true
+// execution mode) must still resolve the registered project's
+// contract_dependencies. Before wiring the shared projectPathResolver into
+// newProjectContractDependencyLookup, this call site used a raw
+// cfg.FindProjectByPath(executionPath) lookup that a worktree path never
+// satisfies, silently degrading the Contract Evidence gate to a no-op for
+// every worktree execution.
+func TestNewProjectContractDependencyLookup_ResolvesAcrossWorktree(t *testing.T) {
+	tmp := t.TempDir()
+	mainRepo := filepath.Join(tmp, "main")
+	worktree := filepath.Join(tmp, "pilot-worktree-GH-9002")
+
+	mustGit(t, "", "init", "-q", mainRepo)
+	mustGit(t, mainRepo, "commit", "--allow-empty", "-m", "init", "-q")
+	mustGit(t, mainRepo, "worktree", "add", "--detach", "-q", worktree, "HEAD")
+
+	cfg := &config.Config{
+		Projects: []*config.ProjectConfig{
+			{
+				Name: "worktree-project",
+				Path: mainRepo,
+				ContractDependencies: []config.ContractDependency{
+					{
+						Owner:         "qf-studio",
+						Repo:          "pilot",
+						ContractFiles: []string{"internal/instances/handlers.go"},
+						Ref:           "main",
+					},
+				},
+			},
+		},
+	}
+
+	lookup := newProjectContractDependencyLookup(cfg)
+	// Dispatch as the runner does: the ephemeral execution path, NOT the
+	// project's configured Path.
+	deps := lookup(worktree)
+
+	if len(deps) != 1 {
+		t.Fatalf("lookup(%q) returned %d deps, want 1 — resolution must find the registered project via its worktree's git common-dir", worktree, len(deps))
+	}
+	got := deps[0]
+	if got.Owner != "qf-studio" || got.Repo != "pilot" || got.Ref != "main" {
+		t.Errorf("lookup(%q)[0] = %+v, want Owner=qf-studio Repo=pilot Ref=main", worktree, got)
+	}
+}
+
+// TestNewProjectContractDependencyLookup_UnrelatedCloneDoesNotAlias mirrors
+// TestNewProjectQualityCheckerFactory_UnrelatedCloneDoesNotAlias, preserving
+// the GH-3050 guarantee for this call site too: an unrelated clone of the
+// same upstream repo at a different, unregistered path must not resolve to
+// a registered project's contract_dependencies just because it shares
+// history/content.
+func TestNewProjectContractDependencyLookup_UnrelatedCloneDoesNotAlias(t *testing.T) {
+	tmp := t.TempDir()
+	mainRepo := filepath.Join(tmp, "main")
+	unrelatedClone := filepath.Join(tmp, "unrelated-clone")
+
+	mustGit(t, "", "init", "-q", mainRepo)
+	mustGit(t, mainRepo, "commit", "--allow-empty", "-m", "init", "-q")
+	mustGit(t, "", "init", "-q", unrelatedClone)
+	mustGit(t, unrelatedClone, "commit", "--allow-empty", "-m", "init", "-q")
+
+	cfg := &config.Config{
+		Projects: []*config.ProjectConfig{
+			{
+				Name: "worktree-project",
+				Path: mainRepo,
+				ContractDependencies: []config.ContractDependency{
+					{
+						Owner:         "qf-studio",
+						Repo:          "pilot",
+						ContractFiles: []string{"internal/instances/handlers.go"},
+						Ref:           "main",
+					},
+				},
+			},
+		},
+	}
+
+	lookup := newProjectContractDependencyLookup(cfg)
+
+	if deps := lookup(unrelatedClone); len(deps) != 0 {
+		t.Errorf("lookup(%q) = %v, want empty — an unrelated clone at an unregistered path must not alias the registered project's contract_dependencies", unrelatedClone, deps)
+	}
+}
+
 // =============================================================================
 // GH-5022: newProjectContractContentFetcher — end-to-end activation check
 // =============================================================================
