@@ -847,6 +847,53 @@ autopilot:
     #                              # active and ALL non-excluded checks gate CI status.
     discovery_grace_period: 60s   # Wait for CI to start
 
+  # Review-feedback loop (GH-5): consumes CHANGES_REQUESTED reviews (and,
+  # optionally, other review states — see trigger_states below) to spawn a
+  # revision issue and close the PR, so a follow-up Pilot run can address the
+  # feedback. Runs in both polling mode (hasChangesRequested) and webhook
+  # mode (OnReviewRequested); trigger_states and trusted_bot_reviewers apply
+  # identically to both.
+  review_feedback:
+    enabled: true
+    # max_iterations limits how many revision issues can be chained before
+    # giving up (the PR is closed outright once exhausted). Default: 3.
+    max_iterations: 3
+    # trigger_states lists the review states (case-insensitive) that start a
+    # revision cycle. Default (commented out below): only "changes_requested"
+    # — reproduces Pilot's original behaviour byte-for-byte.
+    #
+    # Widen this to reach feedback that never arrives as CHANGES_REQUESTED —
+    # e.g. a repository ruleset running `copilot_code_review` with
+    # `review_on_push: true` submits COMMENTED reviews carrying substantive
+    # line-level comments, but never CHANGES_REQUESTED, so the loop can never
+    # fire against it under the default.
+    #
+    # Caution (interacts with a separate known issue, GH-4): every review
+    # matching a configured trigger state advances max_iterations, and
+    # reaching the limit closes the PR outright. On a repo whose ruleset
+    # re-reviews every push, widening trigger_states makes that counter
+    # advance at the reviewer's cadence rather than per genuine round of
+    # human feedback — set max_iterations generously if you widen this.
+    # trigger_states: [changes_requested, commented]
+    #
+    # trusted_bot_reviewers is an allowlist of bot logins (exact,
+    # case-insensitive) exempt from the blanket "skip every bot reviewer"
+    # filter (a login containing "[bot]" or ending in "-bot" is treated as a
+    # bot). Default (commented out below): empty — no bot is trusted, so
+    # every bot reviewer is skipped, reproducing Pilot's original behaviour.
+    # Pilot's own review of its own PR is always excluded, regardless of this
+    # list.
+    # trusted_bot_reviewers: ["copilot-pull-request-reviewer[bot]"]
+    #
+    # Note: a review pulls a PR out of awaiting_approval back into
+    # review_requested. That's reasonable for a human reviewer, but on a
+    # human-gated setup (an environment's require_approval: true) it means a
+    # PR parked awaiting an operator's manual merge is no longer at rest once
+    # trigger_states/trusted_bot_reviewers admit automated reviewers — a bot
+    # re-review after the PR is already sitting in awaiting_approval can pull
+    # it back into the revision cycle. Worth knowing before enabling this on
+    # a require_approval environment.
+
   # Test-evidence gate (GH-4329): escalate-only, same pattern as the
   # scope-drift/size-floor gates above. Green CI proves a check concluded
   # "success" — it does NOT prove tests actually ran. When enabled, autopilot

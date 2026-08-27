@@ -327,6 +327,12 @@ func (cfg *PlatformBreakerConfig) PauseAdmissionEnabled() bool {
 	return *cfg.PauseAdmission
 }
 
+// defaultReviewTriggerState is the review state that starts a revision cycle
+// when TriggerStates is unset. It reproduces Pilot's original hardcoded
+// behaviour (both hasChangesRequested and OnReviewRequested used to check
+// for exactly this state, in their respective API surface's casing).
+const defaultReviewTriggerState = "changes_requested"
+
 // ReviewFeedbackConfig holds configuration for handling PR review change requests.
 type ReviewFeedbackConfig struct {
 	// Enabled controls whether review feedback handling is active.
@@ -334,6 +340,66 @@ type ReviewFeedbackConfig struct {
 	// MaxIterations limits how many revision issues can be chained before giving up.
 	// Prevents infinite review-fix cycles. Default: 3. Set to 0 to disable the limit.
 	MaxIterations int `yaml:"max_iterations"`
+	// TriggerStates lists the review states (case-insensitive; matches both the
+	// polling REST API's upper-case form like "CHANGES_REQUESTED" and the
+	// webhook payload's lower-case form like "changes_requested") that start a
+	// revision cycle. Default (nil/empty): only "changes_requested", matching
+	// Pilot's original hardcoded behaviour.
+	//
+	// GH-5: widening this to include e.g. "commented" lets an automated
+	// reviewer (a repo ruleset running copilot_code_review, for example) drive
+	// the feedback loop even though it never submits CHANGES_REQUESTED.
+	//
+	// Interacts with GH-4: every review event matching a configured trigger
+	// state advances the MaxIterations counter, which closes the PR outright
+	// once exhausted. On a repo whose ruleset re-reviews every push, widening
+	// TriggerStates makes the counter advance at the reviewer's cadence rather
+	// than per genuine round of human feedback.
+	TriggerStates []string `yaml:"trigger_states"`
+	// TrustedBotReviewers is an allowlist of bot logins (exact match,
+	// case-insensitive) exempted from the blanket "skip every bot reviewer"
+	// filter. Default (nil/empty): no bot is trusted, matching Pilot's
+	// original behaviour of skipping every reviewer whose login contains
+	// "[bot]" or ends in "-bot".
+	//
+	// Pilot's own review of its own PR is excluded unconditionally and can
+	// never be re-enabled via this list — see isSelfReview.
+	TrustedBotReviewers []string `yaml:"trusted_bot_reviewers"`
+}
+
+// IsTriggerState reports whether state should start a revision cycle. The
+// comparison is case-insensitive so callers can pass either the polling REST
+// API's upper-case state or the webhook payload's lower-case state without
+// normalising first. A nil config, or a config with an empty TriggerStates
+// list, falls back to the single default state — reproducing Pilot's
+// original hardcoded "changes_requested" check byte-for-byte.
+func (c *ReviewFeedbackConfig) IsTriggerState(state string) bool {
+	if c == nil || len(c.TriggerStates) == 0 {
+		return strings.EqualFold(state, defaultReviewTriggerState)
+	}
+	for _, s := range c.TriggerStates {
+		if strings.EqualFold(s, state) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsTrustedBotReviewer reports whether login is explicitly allow-listed to
+// bypass the blanket bot-reviewer skip. The comparison is case-insensitive.
+// A nil config, or a config with an empty TrustedBotReviewers list, trusts no
+// bot — reproducing Pilot's original behaviour of skipping every bot
+// reviewer unconditionally.
+func (c *ReviewFeedbackConfig) IsTrustedBotReviewer(login string) bool {
+	if c == nil {
+		return false
+	}
+	for _, l := range c.TrustedBotReviewers {
+		if strings.EqualFold(l, login) {
+			return true
+		}
+	}
+	return false
 }
 
 // CIChecksConfig holds configuration for CI check monitoring.
