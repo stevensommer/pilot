@@ -290,6 +290,12 @@ orchestrator:
     wait_for_merge: true       # Wait for PR merge before picking next issue (sequential only)
     poll_interval: 30s         # How often to check PR status
     pr_timeout: 1h             # Max time to wait for PR merge
+                               # NOTE (issue #4): this mode also gates what happens when
+                               # autopilot.max_ci_fix_iterations / review_feedback.max_iterations
+                               # is reached — see the comment on max_ci_fix_iterations below.
+                               # Only "sequential" closes the PR outright (its poller genuinely
+                               # blocks on this PR); "auto"/"parallel" leave it open, held for a
+                               # human, since nothing downstream is waiting on it.
 
 # Executor settings
 executor:
@@ -822,6 +828,40 @@ autopilot:
   github_review:
     poll_interval: 30s
 
+  # max_ci_fix_iterations caps how many CI-fix issues can chain off a single
+  # PR lineage before autopilot gives up (GH-1566). Default 3 (see
+  # DefaultConfig in internal/autopilot/types.go).
+  #
+  # review_feedback.max_iterations is the same cap for "changes requested"
+  # review rounds (see the `review_feedback:` block further down).
+  #
+  # IMPORTANT — counting semantics (issue #4): the counter is NOT "rounds of
+  # fixes completed." It is read from the *origin issue's* `autopilot-meta`
+  # comment, which is stamped with the new iteration number the moment a
+  # revision/fix issue is *filed* — before that issue's own PR has even been
+  # created, let alone passed CI or landed. Concretely, with a limit of N:
+  # the Nth revision/fix issue IS allowed to be filed and produces a PR, but
+  # that PR's own body already carries iteration:N — so the very next CI
+  # failure or review-changes-requested event *on that PR* immediately reads
+  # iteration(N) >= max(N) and is treated as having exhausted the budget,
+  # even though the PR itself may be green CI, mergeable, and otherwise
+  # exactly matching its issue's acceptance criteria. In other words,
+  # max_iterations: 1 buys exactly one revision issue for the whole lineage,
+  # not "one full round-trip to a landed fix" — set it one higher than the
+  # number of genuine fix/revision attempts you want to allow, and expect
+  # the last generation to have zero budget left for its own feedback.
+  #
+  # Reaching either limit no longer unconditionally closes the PR (that was
+  # the bug this comment documents — see issue #4): under
+  # orchestrator.execution.mode: sequential it still closes the PR (the
+  # sequential poller's merge waiter genuinely blocks on this PR resolving,
+  # so an abandoned PR must be closed to unblock the queue); under every
+  # other mode (auto, parallel) the PR is left open at a distinct
+  # `iteration_limit_hold` stage — not `failed` — with a pilot-needs-human
+  # label and a PR comment, since the work may be entirely healthy and just
+  # hit the round-count cap. A human then continues, merges, or closes it.
+  max_ci_fix_iterations: 3
+
   # CI Check Discovery (v0.34+)
   ci_checks:
     mode: auto                    # auto | manual (default: auto)
@@ -839,6 +879,17 @@ autopilot:
     #                              # startup WARN). If both are empty, no allowlist is
     #                              # active and ALL non-excluded checks gate CI status.
     discovery_grace_period: 60s   # Wait for CI to start
+
+  # Automatic handling of "changes requested" PR reviews (GH-4841): autopilot
+  # spawns a revision issue carrying the review feedback, then closes the
+  # reviewed PR (see max_ci_fix_iterations above for the close-vs-hold gate
+  # on execution.mode) so a fresh PR can pick up the revision issue.
+  review_feedback:
+    enabled: true
+    max_iterations: 3   # same counting semantics/caveat as max_ci_fix_iterations above —
+                         # they share the same autopilot-meta iteration counter per PR
+                         # lineage, so a lineage that has already used CI-fix rounds has
+                         # that many fewer review-feedback rounds left, and vice versa.
 
   # Test-evidence gate (GH-4329): escalate-only, same pattern as the
   # scope-drift/size-floor gates above. Green CI proves a check concluded

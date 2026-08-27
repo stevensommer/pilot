@@ -4564,7 +4564,10 @@ func TestController_CIFixCascadeLimit(t *testing.T) {
 	cfg.CIWaitTimeout = 1 * time.Second
 	cfg.MaxCIFixIterations = 3
 
-	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	// GH-4 (issue #4): this test exercises the close-to-unblock-the-queue
+	// behavior, which is now scoped to execution.mode: sequential — opt in
+	// explicitly so the assertions below (PR closed, StageFailed) still hold.
+	c := NewController(cfg, ghClient, nil, "owner", "repo", WithExecutionMode("sequential"))
 	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc1234", "pilot/GH-10", "")
 
 	ctx := context.Background()
@@ -4606,6 +4609,97 @@ func TestController_CIFixCascadeLimit(t *testing.T) {
 	}
 	if pr.TerminalLabel != github.LabelFailed {
 		t.Errorf("TerminalLabel = %q, want %q (iteration-limit close must not be silently re-queued)", pr.TerminalLabel, github.LabelFailed)
+	}
+}
+
+// TestController_CIFixCascadeLimit_AutoModeHoldsOpen is TestController_CIFixCascadeLimit's
+// GH-4 counterpart: under execution.mode: auto (no WithExecutionMode option
+// applied — the production default), reaching MaxCIFixIterations must hold
+// the PR open at StageIterationLimitHold instead of closing it, since
+// nothing downstream is blocked on this specific PR resolving.
+func TestController_CIFixCascadeLimit_AutoModeHoldsOpen(t *testing.T) {
+	issueCreated := false
+	prClosed := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/owner/repo/commits/abc1234/check-runs":
+			resp := github.CheckRunsResponse{
+				TotalCount: 1,
+				CheckRuns: []github.CheckRun{
+					{Name: "build", Status: "completed", Conclusion: "failure"},
+				},
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(resp)
+		case r.URL.Path == "/repos/owner/repo/issues/10" && r.Method == "GET":
+			// Return issue body with iteration:3 (at the limit)
+			resp := github.Issue{
+				Number: 10,
+				State:  "open",
+				Body:   "Fix CI failure\n\n<!-- autopilot-meta branch:pilot/GH-5 pr:99 iteration:3 -->\n",
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(resp)
+		case r.URL.Path == "/repos/owner/repo/issues" && r.Method == "POST":
+			issueCreated = true
+			resp := github.Issue{Number: 200}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(resp)
+		case r.URL.Path == "/repos/owner/repo/pulls/42" && r.Method == "PATCH":
+			prClosed = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	ghClient := github.NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	cfg := DefaultConfig()
+	cfg.Environment = EnvStage
+	cfg.CIPollInterval = 10 * time.Millisecond
+	cfg.CIWaitTimeout = 1 * time.Second
+	cfg.MaxCIFixIterations = 3
+
+	// No WithExecutionMode option applied — matches production's default
+	// (config.DefaultExecutionConfig().Mode == "auto").
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc1234", "pilot/GH-10", "")
+
+	ctx := context.Background()
+
+	if err := c.ProcessPR(ctx, 42, nil); err != nil { // Stage 1: PR created → waiting CI
+		t.Fatalf("ProcessPR stage 1 error: %v", err)
+	}
+	if err := c.ProcessPR(ctx, 42, nil); err != nil { // Stage 2: waiting CI → CI failed
+		t.Fatalf("ProcessPR stage 2 error: %v", err)
+	}
+	pr, _ := c.GetPRState(42)
+	if pr.Stage != StageCIFailed {
+		t.Fatalf("after stage 2: Stage = %s, want %s", pr.Stage, StageCIFailed)
+	}
+
+	// Stage 3: CI failed → iteration limit reached — must hold, not close.
+	if err := c.ProcessPR(ctx, 42, nil); err != nil {
+		t.Fatalf("ProcessPR stage 3 error: %v", err)
+	}
+
+	if issueCreated {
+		t.Error("fix issue should NOT have been created when iteration limit is reached")
+	}
+	if prClosed {
+		t.Error("PR must NOT be closed under execution.mode: auto — nothing downstream blocks on this PR resolving")
+	}
+	pr, _ = c.GetPRState(42)
+	if pr.Stage != StageIterationLimitHold {
+		t.Errorf("after stage 3: Stage = %s, want %s (must not be StageFailed)", pr.Stage, StageIterationLimitHold)
+	}
+	if !strings.Contains(pr.Error, "CI fix iteration limit reached") {
+		t.Errorf("error should mention iteration limit, got: %s", pr.Error)
+	}
+	if pr.TerminalLabel == github.LabelFailed {
+		t.Error("TerminalLabel must not be pilot-failed — this PR was never actually closed")
 	}
 }
 
@@ -4694,7 +4788,10 @@ func TestController_CIFailedClose_PostsCommentsAndCorrectsLabels(t *testing.T) {
 	cfg.CIWaitTimeout = 1 * time.Second
 	cfg.MaxCIFixIterations = 3
 
-	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	// GH-4 (issue #4): this test targets notifyExternalClose's audit trail
+	// after the iteration-limit close, which only happens under
+	// execution.mode: sequential now — opt in explicitly.
+	c := NewController(cfg, ghClient, nil, "owner", "repo", WithExecutionMode("sequential"))
 	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc1234", "pilot/GH-10", "")
 
 	ctx := context.Background()
@@ -6599,7 +6696,12 @@ func TestController_HandleReviewRequested_IterationLimit(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ReviewFeedback = &ReviewFeedbackConfig{Enabled: true, MaxIterations: 3}
 
-	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	// GH-4 (issue #4): this test exercises the close-to-unblock-the-queue
+	// behavior, now scoped to execution.mode: sequential — opt in explicitly
+	// so the assertions below (PR closed, StageFailed) still hold. The
+	// non-sequential ("auto") counterpart is covered by
+	// TestController_HandleReviewRequested_IterationLimit_AutoModeHoldsOpen.
+	c := NewController(cfg, ghClient, nil, "owner", "repo", WithExecutionMode("sequential"))
 	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc123", "pilot/GH-10", "")
 
 	c.mu.Lock()
@@ -6620,6 +6722,114 @@ func TestController_HandleReviewRequested_IterationLimit(t *testing.T) {
 	}
 	if !strings.Contains(pr.Error, "iteration limit") {
 		t.Errorf("error should mention iteration limit: %s", pr.Error)
+	}
+}
+
+// TestController_HandleReviewRequested_IterationLimit_AutoModeHoldsOpen is
+// the GH-4 regression test: it reproduces the exact scenario from issue #4
+// end to end — a PR sitting at StageReviewRequested (pulled in from
+// awaiting_approval by an incoming "changes requested" review) whose origin
+// issue's autopilot-meta counter has already reached review_feedback's
+// max_iterations of 1, under execution.mode: auto (the default; no
+// WithExecutionMode option applied). Before this fix, handleReviewRequested
+// closed the PR unconditionally the instant the counter was at/over the
+// limit — discarding it regardless of how healthy the underlying work was.
+// Now, under a non-sequential execution mode, the PR must be left open at a
+// new, distinct StageIterationLimitHold stage (never StageFailed, which
+// would misrepresent healthy work as defective) so a human can inspect,
+// continue, or close it.
+func TestController_HandleReviewRequested_IterationLimit_AutoModeHoldsOpen(t *testing.T) {
+	var prClosed, needsHumanLabelAdded bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/owner/repo/pulls/42/reviews":
+			// The "incoming review" that pulled this PR from awaiting_approval
+			// into review_requested — the PR itself has nothing wrong with it
+			// (green CI, mergeable); this is simply a reviewer requesting one
+			// more look.
+			resp := []*github.PullRequestReview{
+				{ID: 1, User: github.User{Login: "alice"}, Body: "One more nit", State: "CHANGES_REQUESTED"},
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, resp))
+		case r.URL.Path == "/repos/owner/repo/pulls/42/comments":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("[]"))
+		case r.URL.Path == "/repos/owner/repo/issues/10" && r.Method == http.MethodGet:
+			// Origin issue's autopilot-meta counter is already at the
+			// configured limit of 1 — e.g. this PR is itself a prior
+			// revision generation that has now drawn its own, separate
+			// review feedback.
+			resp := github.Issue{
+				Number: 10,
+				State:  "open",
+				Body:   "some body\n<!-- autopilot-meta branch:pilot/GH-10 pr:42 iteration:1 -->",
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, resp))
+		case r.URL.Path == "/repos/owner/repo/pulls/42" && r.Method == http.MethodPatch:
+			prClosed = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, github.PullRequest{Number: 42, State: "closed"}))
+		case r.URL.Path == "/repos/owner/repo/issues/10/labels" && r.Method == http.MethodPost:
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for _, l := range body.Labels {
+				if l == labelNeedsHuman {
+					needsHumanLabelAdded = true
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("[]"))
+		case r.URL.Path == "/repos/owner/repo/issues/42/comments" && r.Method == http.MethodPost:
+			// holdAtIterationLimit's explanatory PR comment.
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":1}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	ghClient := github.NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	cfg := DefaultConfig()
+	cfg.ReviewFeedback = &ReviewFeedbackConfig{Enabled: true, MaxIterations: 1}
+
+	// No WithExecutionMode option applied — matches production's default
+	// (config.DefaultExecutionConfig().Mode == "auto") and this issue's
+	// reported scenario.
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc123", "pilot/GH-10", "")
+
+	c.mu.Lock()
+	c.activePRs[42].Stage = StageReviewRequested
+	c.mu.Unlock()
+
+	if err := c.ProcessPR(context.Background(), 42, nil); err != nil {
+		t.Fatalf("ProcessPR error: %v", err)
+	}
+
+	pr, ok := c.GetPRState(42)
+	if !ok {
+		t.Fatal("PR should still be tracked")
+	}
+	if pr.Stage != StageIterationLimitHold {
+		t.Errorf("stage = %s, want %s (must not be StageFailed — the PR may be entirely healthy)", pr.Stage, StageIterationLimitHold)
+	}
+	if !strings.Contains(pr.Error, "iteration limit") {
+		t.Errorf("error should mention iteration limit: %s", pr.Error)
+	}
+	if pr.TerminalLabel == github.LabelFailed {
+		t.Error("TerminalLabel must not be pilot-failed — this PR was never actually closed")
+	}
+	if prClosed {
+		t.Error("PR must NOT be closed under execution.mode: auto — closing here would discard potentially healthy, mergeable work with no one to notice")
+	}
+	if !needsHumanLabelAdded {
+		t.Error("origin issue should be labeled pilot-needs-human so an operator can find this hold")
 	}
 }
 
@@ -10508,7 +10718,10 @@ func TestController_IssuesProcessed_TerminalFailure(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Environment = EnvDev
 	cfg.MaxCIFixIterations = 3
-	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	// GH-4 (issue #4): this test targets the terminal-failure metric recorded
+	// on the iteration-limit close path, which is now scoped to
+	// execution.mode: sequential — opt in explicitly.
+	c := NewController(cfg, ghClient, nil, "owner", "repo", WithExecutionMode("sequential"))
 	c.OnPRCreated(55, "https://github.com/owner/repo/pull/55", 20, "failsha1", "pilot/GH-20", "")
 	pr, _ := c.GetPRState(55)
 	pr.Stage = StageCIFailed
@@ -10523,6 +10736,64 @@ func TestController_IssuesProcessed_TerminalFailure(t *testing.T) {
 	}
 	if snap.IssuesProcessed["success"] != 0 {
 		t.Errorf("IssuesProcessed[success] = %d, want 0", snap.IssuesProcessed["success"])
+	}
+}
+
+// TestController_IssuesProcessed_IterationLimitHold_AutoMode is
+// TestController_IssuesProcessed_TerminalFailure's GH-4 counterpart: under
+// execution.mode: auto (no WithExecutionMode option applied), reaching the
+// same iteration limit must record the distinct "iteration_limit_hold"
+// metric instead of "failed" — this PR was never actually closed, so it must
+// not be counted the same way a genuine terminal failure is.
+func TestController_IssuesProcessed_IterationLimitHold_AutoMode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/owner/repo/commits/failsha1/check-runs":
+			_, _ = w.Write(mustJSON(t, github.CheckRunsResponse{
+				TotalCount: 1,
+				CheckRuns:  []github.CheckRun{{Name: "build", Status: "completed", Conclusion: "failure"}},
+			}))
+		case r.URL.Path == "/repos/owner/repo/issues/20" && r.Method == http.MethodGet:
+			// iteration:3 >= MaxCIFixIterations(3) → terminal stop
+			_, _ = w.Write(mustJSON(t, github.Issue{
+				Number: 20,
+				State:  "open",
+				Body:   "Fix CI failures.\n\n<!-- autopilot-meta branch:pilot/GH-20 pr:55 iteration:3 -->\n",
+			}))
+		case r.URL.Path == "/repos/owner/repo/pulls/55" && r.Method == http.MethodPatch:
+			t.Error("PR must not be closed under execution.mode: auto")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{}"))
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{}"))
+		}
+	}))
+	defer server.Close()
+
+	ghClient := github.NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	cfg := DefaultConfig()
+	cfg.Environment = EnvDev
+	cfg.MaxCIFixIterations = 3
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	c.OnPRCreated(55, "https://github.com/owner/repo/pull/55", 20, "failsha1", "pilot/GH-20", "")
+	pr, _ := c.GetPRState(55)
+	pr.Stage = StageCIFailed
+
+	if err := c.ProcessPR(context.Background(), 55, nil); err != nil {
+		t.Fatalf("ProcessPR returned error: %v", err)
+	}
+
+	snap := c.metrics.Snapshot()
+	if snap.IssuesProcessed["failed"] != 0 {
+		t.Errorf("IssuesProcessed[failed] = %d, want 0 (PR was held, not failed)", snap.IssuesProcessed["failed"])
+	}
+	if snap.IssuesProcessed["iteration_limit_hold"] != 1 {
+		t.Errorf("IssuesProcessed[iteration_limit_hold] = %d, want 1", snap.IssuesProcessed["iteration_limit_hold"])
+	}
+	pr, _ = c.GetPRState(55)
+	if pr.Stage != StageIterationLimitHold {
+		t.Errorf("Stage = %s, want %s", pr.Stage, StageIterationLimitHold)
 	}
 }
 
@@ -11439,7 +11710,10 @@ func TestController_handleCIFailed_BoardSync_IterationLimit(t *testing.T) {
 			cfg.MaxCIFixIterations = 3 // iteration = 3 >= MaxCIFixIterations = 3 → limit hit
 
 			opt := withBoardSyncerForTest(mock, "Done", tt.failStatus, "In Review", "")
-			c := NewController(cfg, ghClient, nil, "owner", "repo", opt)
+			// GH-4 (issue #4): the "Blocked/Failed" board-column sync on
+			// iteration-limit close is scoped to execution.mode: sequential
+			// now — opt in explicitly so this test still exercises it.
+			c := NewController(cfg, ghClient, nil, "owner", "repo", opt, WithExecutionMode("sequential"))
 
 			prState := &PRState{
 				PRNumber:    42,

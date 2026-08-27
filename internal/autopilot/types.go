@@ -952,6 +952,17 @@ const (
 	StageReviewRequested PRStage = "review_requested"
 	// StageFailed indicates the PR pipeline has failed and requires intervention.
 	StageFailed PRStage = "failed"
+	// StageIterationLimitHold indicates a CI-fix or review-feedback iteration
+	// limit was reached under a non-sequential execution.mode (auto/parallel),
+	// where nothing downstream blocks on this PR resolving. Unlike
+	// StageFailed, the PR itself is left open and its branch intact — the
+	// work may be entirely healthy (green CI, mergeable) and simply hit the
+	// round-count cap, so this is deliberately not "failed": a human decides
+	// whether to continue, merge, or close it. Terminal from autopilot's own
+	// point of view (ProcessPR treats it as a dead end, same as StageFailed)
+	// but distinct for labeling/alerting so it never reads as defective work.
+	// GH-4 (github.com/stevensommer/pilot).
+	StageIterationLimitHold PRStage = "iteration_limit_hold"
 )
 
 // AllPRStages returns every defined PRStage value. Used by the Prometheus exporter
@@ -970,6 +981,7 @@ func AllPRStages() []PRStage {
 		StageReleasing,
 		StageReviewRequested,
 		StageFailed,
+		StageIterationLimitHold,
 	}
 }
 

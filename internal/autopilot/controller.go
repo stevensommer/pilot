@@ -339,6 +339,19 @@ func WithPilotLabel(label string) ControllerOption {
 	}
 }
 
+// WithExecutionMode wires orchestrator.execution.mode ("sequential",
+// "parallel", or "auto") into the controller so the iteration-limit branches
+// of handleCIFailed/handleReviewRequested know whether an abandoned PR is an
+// actual queue blocker. Mirrors poller_github.go's own
+// deps.Cfg.Orchestrator.Execution.Mode resolution. Passing "" (Execution
+// block absent, or mode left as the zero value) is equivalent to "auto" for
+// this purpose — see isSequentialExecutionMode.
+func WithExecutionMode(mode string) ControllerOption {
+	return func(c *Controller) {
+		c.executionMode = mode
+	}
+}
+
 // WithProjectPath sets the filesystem project path used to scope execution
 // self-heal (SelfHealExecutionAfterMerge) to this project's rows. It MUST match
 // the value the executor stored in executions.project_path — an absolute fs path
@@ -615,6 +628,16 @@ type Controller struct {
 	// WithPilotLabel to match a non-default adapters.github.pilot_label).
 	// GH-4454.
 	pilotLabel string
+
+	// executionMode mirrors orchestrator.execution.mode ("sequential",
+	// "parallel", or "auto"/empty), wired via WithExecutionMode. Only
+	// "sequential" makes an abandoned PR a genuine queue blocker (the
+	// sequential poller waits for this PR to resolve before starting the
+	// next task) — every other value, including the empty zero value for a
+	// controller nobody wired this on (tests, WithExecutionMode never
+	// called), must not pay sequential's ClosePullRequest cost since nothing
+	// downstream is actually waiting on this PR. See isSequentialExecutionMode.
+	executionMode string
 
 	// stepLogClient is the optional in-tree GitHub client CIMonitor uses to
 	// resolve a failed check run down to its actual failing step via the
@@ -2469,6 +2492,13 @@ func (c *Controller) RestoreState() (int, error) {
 		if pr.Stage == StageFailed && !pr.BreakerHoldActive {
 			continue
 		}
+		// StageIterationLimitHold has no re-drive path (unlike the breaker
+		// hold above) — a human resolves it by hand (continue, merge, or
+		// close the PR themselves), so it is unconditionally skipped on
+		// restart, same as the ordinary StageFailed case.
+		if pr.Stage == StageIterationLimitHold {
+			continue
+		}
 		// GH-4331: a scope carrier whose scope-release row already resolved
 		// terminal (failed/done) between its last persist and this restart
 		// must not be rehydrated — re-ticking it would re-run
@@ -2804,6 +2834,13 @@ func (c *Controller) ProcessPR(ctx context.Context, prNumber int, ghPR *github.P
 		err = c.handleReleasing(ctx, prState)
 	case StageFailed:
 		// Terminal state - no processing
+		return nil
+	case StageIterationLimitHold:
+		// Terminal from autopilot's point of view (a human resolves this by
+		// hand — continue, merge, or close) — no automated processing, same
+		// as StageFailed, but the PR itself stays open with its branch
+		// intact. See handleCIFailed/handleReviewRequested's iteration-limit
+		// branches.
 		return nil
 	}
 
@@ -3465,6 +3502,20 @@ func (c *Controller) gh4997CIFixSpawnGate(ctx context.Context, prState *PRState)
 	return false, ""
 }
 
+// isSequentialExecutionMode reports whether this controller is running under
+// orchestrator.execution.mode: sequential — the only mode where the
+// sequential poller actually blocks on this specific PR resolving before it
+// starts the next queued task. handleCIFailed/handleReviewRequested's
+// iteration-limit branches gate ClosePullRequest on this: under sequential,
+// an abandoned PR is a genuine queue blocker and closing it to unblock the
+// poller is correct (and unchanged from before); under every other mode
+// (auto, parallel, or unset — see WithExecutionMode) nothing is blocked on
+// this PR, so closing it would only discard whatever CI-green/mergeable work
+// already exists on the branch. See issue #4.
+func (c *Controller) isSequentialExecutionMode() bool {
+	return c.executionMode == "sequential"
+}
+
 func (c *Controller) handleCIFailed(ctx context.Context, prState *PRState) error {
 	// GH-4533: classify the failure as code vs. CI infrastructure outage
 	// before doing anything else. An infra-classified failure with retry
@@ -3586,7 +3637,28 @@ func (c *Controller) handleCIFailed(ctx context.Context, prState *PRState) error
 				"issue", prState.IssueNumber,
 				"iteration", iteration,
 				"max", c.config.MaxCIFixIterations,
+				"sequential", c.isSequentialExecutionMode(),
 			)
+
+			reason := fmt.Sprintf("CI fix iteration limit reached (%d/%d): stopping cascade to prevent infinite loop", iteration, c.config.MaxCIFixIterations)
+			if len(failedChecks) > 0 {
+				reason = fmt.Sprintf("%s (failing checks: %s)", reason, strings.Join(failedChecks, ", "))
+			}
+
+			// GH-4 (issue #4): closing the PR here is only correct under
+			// execution.mode: sequential, where the sequential poller's merge
+			// waiter genuinely blocks on this PR resolving before starting the
+			// next queued task. Under every other mode nothing is waiting on
+			// this PR, so closing it — regardless of how healthy the work on
+			// its branch actually is — would only discard it; a human never
+			// gets a chance to notice before it disappears from the open list.
+			if !c.isSequentialExecutionMode() {
+				c.holdAtIterationLimit(ctx, prState, reason)
+				c.metrics.RecordPRFailedClass(failureClass)
+				c.recordCIFailVerdict(failureClass)
+				c.metrics.RecordIssueProcessed("iteration_limit_hold")
+				return nil
+			}
 
 			// Close the failed PR so the sequential poller can unblock
 			if err := c.ghClient.ClosePullRequest(ctx, c.owner, c.repo, prState.PRNumber); err != nil {
@@ -3605,10 +3677,6 @@ func (c *Controller) handleCIFailed(ctx context.Context, prState *PRState) error
 			// (which fires on the next poll once it sees this PR closed) can post a
 			// PR/issue comment and correct the issue's labels instead of silently
 			// leaving a stale pilot-in-progress/pilot-done on discarded work.
-			reason := fmt.Sprintf("CI fix iteration limit reached (%d/%d): stopping cascade to prevent infinite loop", iteration, c.config.MaxCIFixIterations)
-			if len(failedChecks) > 0 {
-				reason = fmt.Sprintf("%s (failing checks: %s)", reason, strings.Join(failedChecks, ", "))
-			}
 			prState.Stage = StageFailed
 			prState.Error = reason
 			prState.TerminalLabel = github.LabelFailed
@@ -4041,7 +4109,24 @@ func (c *Controller) handleReviewRequested(ctx context.Context, prState *PRState
 				"pr", prState.PRNumber,
 				"iteration", iteration,
 				"max", c.config.ReviewFeedback.MaxIterations,
+				"sequential", c.isSequentialExecutionMode(),
 			)
+
+			reason := fmt.Sprintf("review feedback iteration limit reached (%d/%d)", iteration, c.config.ReviewFeedback.MaxIterations)
+
+			// GH-4 (issue #4): same gate as handleCIFailed's iteration-limit
+			// branch — closing is only correct under execution.mode:
+			// sequential, where the sequential poller actually blocks on this
+			// PR. This is the exact scenario the issue reported: a PR with
+			// green CI, mergeable, sitting at awaiting_approval, pulled into
+			// review_requested by an incoming review and closed on the very
+			// next pass purely because the counter had reached its limit —
+			// nothing about the PR itself had failed.
+			if !c.isSequentialExecutionMode() {
+				c.holdAtIterationLimit(ctx, prState, reason)
+				c.metrics.RecordIssueProcessed("iteration_limit_hold")
+				return nil
+			}
 
 			if err := c.ghClient.ClosePullRequest(ctx, c.owner, c.repo, prState.PRNumber); err != nil {
 				c.log.Warn("failed to close PR", "pr", prState.PRNumber, "error", err)
@@ -4049,7 +4134,7 @@ func (c *Controller) handleReviewRequested(ctx context.Context, prState *PRState
 
 			// GH-3806: see the matching comment on handleCIFailed's iteration-limit branch.
 			prState.Stage = StageFailed
-			prState.Error = fmt.Sprintf("review feedback iteration limit reached (%d/%d)", iteration, c.config.ReviewFeedback.MaxIterations)
+			prState.Error = reason
 			prState.TerminalLabel = github.LabelFailed
 			c.metrics.RecordPRFailed()
 			c.metrics.RecordIssueProcessed("failed")
@@ -7134,6 +7219,56 @@ func (c *Controller) mutateIssueLabels(ctx context.Context, issueNumber int, add
 // standing, so the retry-ready label is removed in the same mutation. The
 // reverse direction (retry-ready superseding an escalation hold) is
 // enforced at the retry-arming site in notifyExternalClose.
+// holdAtIterationLimit is escalateAndHold's counterpart for a CI-fix or
+// review-feedback iteration limit reached under a non-sequential
+// execution.mode (see isSequentialExecutionMode). Unlike escalateAndHold it
+// deliberately does NOT set StageFailed: the PR reaching this point may be
+// entirely healthy — green CI, mergeable, matching its issue's acceptance
+// criteria — and simply hit the round-count cap, so labeling it "failed"
+// would misrepresent it to anyone triaging by stage/label. It transitions to
+// StageIterationLimitHold instead (still terminal from autopilot's own
+// point of view — ProcessPR takes no further action on it — but distinct),
+// leaves the PR open and the branch intact, labels the issue
+// pilot-needs-human the same way escalateAndHold does, and alerts via
+// EventTypeEscalation (not EventTypeTaskFailed) so on-call channels don't
+// read this as a defective build. GH-4 (github.com/stevensommer/pilot).
+func (c *Controller) holdAtIterationLimit(ctx context.Context, prState *PRState, reason string) {
+	prState.Stage = StageIterationLimitHold
+	prState.Error = reason
+
+	if prState.IssueNumber > 0 {
+		c.mutateIssueLabels(ctx, prState.IssueNumber, []string{labelNeedsHuman}, []string{github.LabelRetryReady})
+	}
+
+	comment := fmt.Sprintf(
+		"%s\n\nThis PR is being left open rather than closed: execution.mode is not `sequential`, so nothing downstream is blocked on it resolving, and closing it here would risk discarding work that may already be healthy (CI passing, mergeable). A human can continue, request another revision round, merge, or close this PR.",
+		reason,
+	)
+	if _, err := c.ghClient.AddPRComment(ctx, c.owner, c.repo, prState.PRNumber, comment); err != nil {
+		c.log.Warn("holdAtIterationLimit: failed to post PR comment", "pr", prState.PRNumber, "error", err)
+	}
+
+	if c.alertsEngine == nil {
+		c.log.Error("holdAtIterationLimit: alert not delivered, SetAlertsEngine was never called", "pr", prState.PRNumber, "reason", reason)
+	} else {
+		c.alertsEngine.ProcessEvent(alerts.Event{
+			Type:      alerts.EventTypeEscalation,
+			TaskID:    fmt.Sprintf("pr-%d-iteration-limit-hold", prState.PRNumber),
+			TaskTitle: fmt.Sprintf("PR #%d reached its iteration limit — holding for human review", prState.PRNumber),
+			Project:   c.repoKey(),
+			Error:     reason,
+			Timestamp: time.Now(),
+			Metadata: map[string]string{
+				"repo":  c.repoKey(),
+				"pr":    strconv.Itoa(prState.PRNumber),
+				"issue": strconv.Itoa(prState.IssueNumber),
+			},
+		})
+	}
+
+	c.log.Warn("holdAtIterationLimit: PR held for human review, branch intact, PR left open", "pr", prState.PRNumber, "issue", prState.IssueNumber, "reason", reason)
+}
+
 func (c *Controller) escalateAndHold(ctx context.Context, prState *PRState, reason string, labels []string, comment string) {
 	prState.Stage = StageFailed
 	prState.Error = reason
@@ -8261,8 +8396,13 @@ func (c *Controller) ScanRecentlyMergedPRsWithWindow(ctx context.Context, scanWi
 					"pr", pr.Number,
 					"error", err,
 				)
-			} else if persisted != nil && persisted.Stage == StageFailed {
-				c.log.Debug("skipping PR: persisted state is terminal failed", "pr", pr.Number)
+			} else if persisted != nil && (persisted.Stage == StageFailed || persisted.Stage == StageIterationLimitHold) {
+				// StageIterationLimitHold is terminal from autopilot's own
+				// point of view too (see ProcessPR's switch) — the PR itself
+				// stays open, but re-registering it here would re-enter
+				// StageWaitingCI/StageReviewRequested and spawn another
+				// iteration past the limit that just held it.
+				c.log.Debug("skipping PR: persisted state is terminal (failed or iteration-limit hold)", "pr", pr.Number, "stage", persisted.Stage)
 				continue
 			}
 		}

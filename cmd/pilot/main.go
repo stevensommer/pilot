@@ -914,6 +914,13 @@ Examples:
 							if cfg.Adapters.GitHub.PilotLabel != "" {
 								gwBoardOpts = append(gwBoardOpts, autopilot.WithPilotLabel(cfg.Adapters.GitHub.PilotLabel))
 							}
+							// GH-4 (issue #4): see the matching comment on
+							// autopilotSharedOpts below — the gateway
+							// controller needs the same execution.mode signal
+							// for its iteration-limit branches.
+							if cfg.Orchestrator.Execution != nil && cfg.Orchestrator.Execution.Mode != "" {
+								gwBoardOpts = append(gwBoardOpts, autopilot.WithExecutionMode(cfg.Orchestrator.Execution.Mode))
+							}
 							// GH-4472: resolve via project override → default-repo fallback
 							// instead of reading the global block directly, so a projects[]
 							// entry for this same repo with its own project_board wins.
@@ -2327,6 +2334,20 @@ func runPollingMode(cmd *cobra.Command, cfg *config.Config, projectPath string, 
 			// PilotLabel is empty, so NewController's own default applies).
 			if cfg.Adapters.GitHub != nil && cfg.Adapters.GitHub.PilotLabel != "" {
 				autopilotSharedOpts = append(autopilotSharedOpts, autopilot.WithPilotLabel(cfg.Adapters.GitHub.PilotLabel))
+			}
+			// GH-4 (issue #4): mirrors poller_github.go's own
+			// deps.Cfg.Orchestrator.Execution.Mode resolution — the
+			// controller's iteration-limit branches (handleCIFailed,
+			// handleReviewRequested) need to know whether execution.mode is
+			// "sequential" (the sequential poller genuinely blocks on this
+			// PR resolving, so closing it to unblock the queue is correct)
+			// before deciding whether reaching MaxCIFixIterations /
+			// ReviewFeedback.MaxIterations may close the PR at all. Empty
+			// mode leaves executionMode at its zero value, which
+			// isSequentialExecutionMode treats as non-sequential — matching
+			// config.DefaultExecutionConfig()'s "auto" default.
+			if cfg.Orchestrator.Execution != nil && cfg.Orchestrator.Execution.Mode != "" {
+				autopilotSharedOpts = append(autopilotSharedOpts, autopilot.WithExecutionMode(cfg.Orchestrator.Execution.Mode))
 			}
 
 			// Create controller for default repo (adapters.github.repo)
