@@ -95,6 +95,28 @@ func preserveDirtyWorktreeAsWIP(ctx context.Context, git *GitOperations, task *T
 	message := fmt.Sprintf("wip(%s): uncommitted session work (auto-preserved)", task.ID)
 	newSHA, commitErr := git.Commit(ctx, message)
 	if commitErr != nil {
+		if errors.Is(commitErr, ErrSigningFailed) {
+			// Signing was enabled but the commit invocation itself failed
+			// (e.g. gpg/pinentry unreachable in this execution context).
+			// Git's commit is all-or-nothing under gpgsign, so no commit
+			// was produced at all — there is nothing to push and nothing
+			// that could be silently registered as an unverifiable PR
+			// head. Fail closed the same way a push failure does: pin
+			// whatever is currently reachable under a recovery ref so a
+			// human can investigate, then decline to preserve.
+			recoveryRef, refErr := git.CreateRecoveryRef(ctx, task.ID, "HEAD")
+			fields := []any{
+				slog.String("task_id", task.ID),
+				slog.Any("commit_error", commitErr),
+			}
+			if refErr == nil {
+				fields = append(fields, slog.String("recovery_ref", recoveryRef))
+			} else {
+				fields = append(fields, slog.Any("recovery_ref_error", refErr))
+			}
+			log.Warn("executor: dirty-worktree auto-preserve commit failed due to a signing failure — refusing to register an unverifiable commit as a PR head", fields...)
+			return "", false
+		}
 		if !errors.Is(commitErr, ErrNoStageableChanges) {
 			log.Warn("executor: dirty-worktree auto-preserve commit attempt failed",
 				slog.String("task_id", task.ID),
