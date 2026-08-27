@@ -290,6 +290,12 @@ orchestrator:
     wait_for_merge: true       # Wait for PR merge before picking next issue (sequential only)
     poll_interval: 30s         # How often to check PR status
     pr_timeout: 1h             # Max time to wait for PR merge
+                               # NOTE (issue #4): this mode also gates what happens when
+                               # autopilot.max_ci_fix_iterations / review_feedback.max_iterations
+                               # is reached — see the comment on max_ci_fix_iterations below.
+                               # Only "sequential" closes the PR outright (its poller genuinely
+                               # blocks on this PR); "auto"/"parallel" leave it open, held for a
+                               # human, since nothing downstream is waiting on it.
 
 # Executor settings
 executor:
@@ -829,6 +835,40 @@ autopilot:
   github_review:
     poll_interval: 30s
 
+  # max_ci_fix_iterations caps how many CI-fix issues can chain off a single
+  # PR lineage before autopilot gives up (GH-1566). Default 3 (see
+  # DefaultConfig in internal/autopilot/types.go).
+  #
+  # review_feedback.max_iterations is the same cap for "changes requested"
+  # review rounds (see the `review_feedback:` block further down).
+  #
+  # IMPORTANT — counting semantics (issue #4): the counter is NOT "rounds of
+  # fixes completed." It is read from the *origin issue's* `autopilot-meta`
+  # comment, which is stamped with the new iteration number the moment a
+  # revision/fix issue is *filed* — before that issue's own PR has even been
+  # created, let alone passed CI or landed. Concretely, with a limit of N:
+  # the Nth revision/fix issue IS allowed to be filed and produces a PR, but
+  # that PR's own body already carries iteration:N — so the very next CI
+  # failure or review-changes-requested event *on that PR* immediately reads
+  # iteration(N) >= max(N) and is treated as having exhausted the budget,
+  # even though the PR itself may be green CI, mergeable, and otherwise
+  # exactly matching its issue's acceptance criteria. In other words,
+  # max_iterations: 1 buys exactly one revision issue for the whole lineage,
+  # not "one full round-trip to a landed fix" — set it one higher than the
+  # number of genuine fix/revision attempts you want to allow, and expect
+  # the last generation to have zero budget left for its own feedback.
+  #
+  # Reaching either limit no longer unconditionally closes the PR (that was
+  # the bug this comment documents — see issue #4): under
+  # orchestrator.execution.mode: sequential it still closes the PR (the
+  # sequential poller's merge waiter genuinely blocks on this PR resolving,
+  # so an abandoned PR must be closed to unblock the queue); under every
+  # other mode (auto, parallel) the PR is left open at a distinct
+  # `iteration_limit_hold` stage — not `failed` — with a pilot-needs-human
+  # label and a PR comment, since the work may be entirely healthy and just
+  # hit the round-count cap. A human then continues, merges, or closes it.
+  max_ci_fix_iterations: 3
+
   # CI Check Discovery (v0.34+)
   ci_checks:
     mode: auto                    # auto | manual (default: auto)
@@ -847,16 +887,28 @@ autopilot:
     #                              # active and ALL non-excluded checks gate CI status.
     discovery_grace_period: 60s   # Wait for CI to start
 
-  # Review-feedback loop (GH-5): consumes CHANGES_REQUESTED reviews (and,
+  # Review-feedback loop (GH-4/GH-5): consumes CHANGES_REQUESTED reviews (and,
   # optionally, other review states — see trigger_states below) to spawn a
-  # revision issue and close the PR, so a follow-up Pilot run can address the
-  # feedback. Runs in both polling mode (hasChangesRequested) and webhook
-  # mode (OnReviewRequested); trigger_states and trusted_bot_reviewers apply
-  # identically to both.
+  # revision issue carrying the feedback. Runs in both polling mode
+  # (hasChangesRequested) and webhook mode (OnReviewRequested);
+  # trigger_states and trusted_bot_reviewers apply identically to both.
+  #
+  # Reaching max_iterations no longer unconditionally closes the PR (GH-4):
+  # under execution.mode: sequential the PR is still closed, to unblock the
+  # sequential poller's queue — but under execution.mode: auto (the default)
+  # it's left open, transitioned to a distinct held stage, for a human to
+  # inspect, continue, or close themselves. See max_ci_fix_iterations above
+  # for the identical close-vs-hold gate on the CI-fix side.
   review_feedback:
     enabled: true
     # max_iterations limits how many revision issues can be chained before
-    # giving up (the PR is closed outright once exhausted). Default: 3.
+    # the close-vs-hold gate above applies. Default: 3. Same counting
+    # semantics/caveat as max_ci_fix_iterations above — they share the same
+    # autopilot-meta iteration counter per PR lineage, so a lineage that has
+    # already used CI-fix rounds has that many fewer review-feedback rounds
+    # left, and vice versa. The counter reflects revision issues *filed*,
+    # not rounds of fixes *completed* — a fix issue filed the moment the
+    # limit is reached still spends the budget before its own fix can land.
     max_iterations: 3
     # trigger_states lists the review states (case-insensitive) that start a
     # revision cycle. Default (commented out below): only "changes_requested"
@@ -868,12 +920,12 @@ autopilot:
     # line-level comments, but never CHANGES_REQUESTED, so the loop can never
     # fire against it under the default.
     #
-    # Caution (interacts with a separate known issue, GH-4): every review
-    # matching a configured trigger state advances max_iterations, and
-    # reaching the limit closes the PR outright. On a repo whose ruleset
-    # re-reviews every push, widening trigger_states makes that counter
-    # advance at the reviewer's cadence rather than per genuine round of
-    # human feedback — set max_iterations generously if you widen this.
+    # Caution: every review matching a configured trigger state advances
+    # max_iterations, and reaching the limit still triggers the close-vs-hold
+    # gate described above. On a repo whose ruleset re-reviews every push,
+    # widening trigger_states makes that counter advance at the reviewer's
+    # cadence rather than per genuine round of human feedback — set
+    # max_iterations generously if you widen this.
     # trigger_states: [changes_requested, commented]
     #
     # trusted_bot_reviewers is an allowlist of bot logins (exact,
