@@ -205,10 +205,21 @@ type qualityCheckerWrapper struct {
 // auto-detected minimal build/test gate. This lets one Pilot deployment mix
 // stacks (e.g. Go/Makefile + pnpm/Node) without a global config tuned for
 // one stack forcing the wrong commands onto another.
+//
+// taskProjectPath is the task's *execution* path, which for the default
+// (use_worktree: true) execution mode is an ephemeral worktree, not the
+// project's configured checkout path. A raw cfg.FindProjectByPath lookup
+// therefore never matched during a worktree execution, silently falling
+// through to quality.AutoDetectConfig against the worktree instead of the
+// configured gates. projectPathResolver (project_path_resolver.go) fixes
+// this the same way GH-3050 fixed the repo allowlist: by comparing git
+// common-dirs, which correctly identifies a worktree as belonging to its
+// origin checkout.
 func newProjectQualityCheckerFactory(cfg *config.Config) func(taskID, taskProjectPath string) executor.QualityChecker {
+	resolver := newProjectPathResolver(cfg)
 	return func(taskID, taskProjectPath string) executor.QualityChecker {
 		var projectQuality *quality.Config
-		if proj := cfg.FindProjectByPath(taskProjectPath); proj != nil {
+		if proj := resolver.find(taskProjectPath); proj != nil {
 			projectQuality = proj.Quality
 		}
 		resolved := quality.ResolveConfig(projectQuality, cfg.Quality, taskProjectPath)

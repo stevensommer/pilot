@@ -8,12 +8,8 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"os/exec"
 	"path/filepath"
-	"strings"
-	"time"
 
 	"github.com/qf-studio/pilot/internal/config"
 	"github.com/qf-studio/pilot/internal/executor"
@@ -67,9 +63,10 @@ func (a *configRepoAllowlist) RepoIsAllowed(owner, repo, projectPath string) boo
 }
 
 // isWorktreeOf reports whether worktreePath is a git worktree whose common
-// .git directory belongs to projectPath. Uses `git rev-parse
-// --git-common-dir`, which returns the canonical .git location shared by
-// all worktrees of a repository. A 2s context bounds the git call.
+// .git directory belongs to projectPath. Uses the shared gitCommonDir
+// helper (see gitcommondir.go), which resolves `git rev-parse
+// --git-common-dir` — the canonical .git location shared by all worktrees
+// of a repository.
 //
 // Returns false (deny) on any error — git missing, path not a repo,
 // timeout. The guardrail prefers false negatives (reject worktree) over
@@ -78,18 +75,8 @@ func isWorktreeOf(worktreePath, projectPath string) bool {
 	if worktreePath == "" || projectPath == "" {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "git", "-C", worktreePath, "rev-parse", "--git-common-dir").Output()
-	if err != nil {
-		return false
-	}
-	commonDir := strings.TrimSpace(string(out))
-	if !filepath.IsAbs(commonDir) {
-		commonDir = filepath.Join(worktreePath, commonDir)
-	}
-	commonDir, err = filepath.EvalSymlinks(commonDir)
-	if err != nil {
+	commonDir := gitCommonDir(worktreePath)
+	if commonDir == "" {
 		return false
 	}
 	expected, err := filepath.EvalSymlinks(filepath.Join(projectPath, ".git"))
