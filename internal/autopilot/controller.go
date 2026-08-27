@@ -9658,6 +9658,7 @@ func (c *Controller) notifyExternalClose(ctx context.Context, prState *PRState) 
 			// issue actually dies and the source needs to become pollable
 			// again.
 			hasLiveDesignatedOwner := false
+			liveDesignatedFixIssue := 0
 			if issueLabel == github.LabelFailed && c.stateStore != nil {
 				if fixIssue, ferr := c.stateStore.HasSpawnedFixForPR(c.repoKey(), prState.PRNumber); ferr != nil {
 					c.log.Warn("durable spawned-fix lookup failed while checking blind-retry guard, leaving issue pollable",
@@ -9674,6 +9675,7 @@ func (c *Controller) notifyExternalClose(ctx context.Context, prState *PRState) 
 							"pr", prState.PRNumber, "fix_issue", fixIssue, "error", gerr)
 					} else if classifyOwnerHealth(fixGH) != ownerDead {
 						hasLiveDesignatedOwner = true
+						liveDesignatedFixIssue = fixIssue
 					}
 				}
 			}
@@ -9729,6 +9731,38 @@ func (c *Controller) notifyExternalClose(ctx context.Context, prState *PRState) 
 				}
 			}
 			c.mutateIssueLabels(ctx, prState.IssueNumber, addLabels, removeLabels)
+
+			// GH-17: stripping the pilot label above stopped the poller from
+			// re-dispatching this issue, but left it open — and
+			// CreateFailureIssue/CreateReviewIssue (feedback_loop.go) write a
+			// literal "Depends on: #<source>" line into the fix issue's body
+			// that internal/executor/base_presence.go's dispatch-time guard
+			// holds against until that referenced issue's own state reports
+			// closed (or its linked PR reports merged). An open-but-unlabeled
+			// source issue never satisfies that, so the fix issue — the only
+			// thing now capable of carrying the work forward — would sit
+			// held forever. Close the source issue for real here so the
+			// guard resolves immediately and the fix issue becomes
+			// dispatchable on the very next poll. Reopened by
+			// rearmDeadOwnerSource (owner_death.go) if this designated fix
+			// issue later dies before shipping.
+			if hasLiveDesignatedOwner {
+				closeComment := fmt.Sprintf(
+					"Closing this issue: fix issue #%d has taken over ownership of the continued work for PR #%d. Follow progress there.",
+					liveDesignatedFixIssue, prState.PRNumber,
+				)
+				if _, cerr := c.ghClient.AddComment(ctx, c.owner, c.repo, prState.IssueNumber, closeComment); cerr != nil {
+					c.log.Warn("failed to comment on source issue before closing for fix-issue takeover",
+						"issue", prState.IssueNumber, "fix_issue", liveDesignatedFixIssue, "error", cerr)
+				}
+				if cerr := c.ghClient.UpdateIssueState(ctx, c.owner, c.repo, prState.IssueNumber, github.StateClosed); cerr != nil {
+					c.log.Warn("failed to close source issue after fix-issue takeover",
+						"issue", prState.IssueNumber, "fix_issue", liveDesignatedFixIssue, "error", cerr)
+				} else {
+					c.log.Info("closed source issue: fix issue owns continued work",
+						"issue", prState.IssueNumber, "fix_issue", liveDesignatedFixIssue)
+				}
+			}
 		}
 
 		// Task 5e: unlike the other gated sites, this one still posts the

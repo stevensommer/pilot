@@ -176,8 +176,18 @@ func (c *Controller) reactToDeadFixIssue(ctx context.Context, deadIssue *github.
 		c.log.Warn("owner-death: failed to fetch source issue", "fix_issue", deadIssue.Number, "source", sourceNum, "error", err)
 		return
 	}
-	if source.State == github.StateClosed {
-		c.log.Info("owner-death: source issue already closed, nothing to re-arm", "fix_issue", deadIssue.Number, "source", sourceNum)
+	// GH-17: notifyExternalClose now closes (not merely relabels) a source
+	// issue once a live fix issue is confirmed to own the continuation, so a
+	// closed source is no longer proof there's nothing left to do here — it
+	// may be exactly this fix issue's own takeover closure, now stranded
+	// because that fix issue just died. Only bail out when the close wasn't
+	// ours: an issue notifyExternalClose closed for a fix-issue takeover
+	// still carries pilot-failed (the label written in the very same
+	// mutation as the close); a source closed for any other reason (shipped
+	// via pilot-done, closed by a human, superseded) never does, and must be
+	// left alone.
+	if source.State == github.StateClosed && !github.HasLabel(source, github.LabelFailed) {
+		c.log.Info("owner-death: source issue already closed for an unrelated reason, nothing to re-arm", "fix_issue", deadIssue.Number, "source", sourceNum)
 		return
 	}
 	designated := github.HasLabel(source, github.LabelFailed)
@@ -223,6 +233,14 @@ func (c *Controller) reactToDeadFixIssue(ctx context.Context, deadIssue *github.
 // re-enters the normal retry ladder, mirroring the relabeling notifyExternalClose
 // already performs for the reactive-close path (controller.go).
 func (c *Controller) rearmDeadOwnerSource(ctx context.Context, source *github.Issue, reasonMsg string) {
+	// GH-17: a source closed for a fix-issue takeover (see the closed-check
+	// above) must be reopened as part of re-arming it — relabeling alone
+	// leaves it closed, which strands the work with no path back into the
+	// poller's queue at all (a closed issue never satisfies fetchCandidates'
+	// label-scoped ListIssues no matter what labels it carries). Reopen
+	// before the label mutation so a poll tick racing this call never
+	// observes "pollable labels, still closed".
+	reopened := reopenSourceIfClosed(ctx, c, source)
 	// GH-15/GH-5032: pilot-retry-ready must always imply pollable — restore
 	// the dispatch label in the same mutation, in case notifyExternalClose's
 	// blind-retry guard stripped it while this source was designated to the
@@ -235,33 +253,66 @@ func (c *Controller) rearmDeadOwnerSource(ctx context.Context, source *github.Is
 	if err := c.labeler.RemoveLabel(ctx, c.owner, c.repo, source.Number, github.LabelFailed); err != nil {
 		c.log.Debug("owner-death: failed to remove pilot-failed label (may not exist)", "issue", source.Number, "error", err)
 	}
+	reopenNote := ""
+	if reopened {
+		reopenNote = " and reopened"
+	}
 	comment := fmt.Sprintf(
-		"\U0001F501 **Owner-death recovery**: %s. Re-armed for automatic retry (`%s` restored).",
-		reasonMsg, github.LabelRetryReady,
+		"\U0001F501 **Owner-death recovery**: %s. Re-armed for automatic retry (`%s` restored%s).",
+		reasonMsg, github.LabelRetryReady, reopenNote,
 	)
 	if _, err := c.ghClient.AddComment(ctx, c.owner, c.repo, source.Number, comment); err != nil {
 		c.log.Warn("owner-death: failed to post re-arm comment", "issue", source.Number, "error", err)
 	}
 	c.fireOwnerDeathAlert(source.Number, reasonMsg, "rearmed")
-	c.log.Warn("owner-death: source re-armed after designated fix issue died", "source", source.Number, "reason", reasonMsg)
+	c.log.Warn("owner-death: source re-armed after designated fix issue died", "source", source.Number, "reason", reasonMsg, "reopened", reopened)
+}
+
+// reopenSourceIfClosed reopens source via UpdateIssueState when it is
+// currently closed, reporting whether a reopen was attempted-and-succeeded.
+// Shared by rearmDeadOwnerSource and escalateDeadOwnerSource (GH-17): both
+// reactions can now observe a source that notifyExternalClose closed for a
+// fix-issue takeover, and both need it open again — rearm so the poller can
+// pick it back up, escalate so a human reviewing pilot-needs-human actually
+// finds it in their normal open-issues view instead of a closed one.
+func reopenSourceIfClosed(ctx context.Context, c *Controller, source *github.Issue) bool {
+	if source.State != github.StateClosed {
+		return false
+	}
+	if err := c.ghClient.UpdateIssueState(ctx, c.owner, c.repo, source.Number, github.StateOpen); err != nil {
+		c.log.Warn("owner-death: failed to reopen source issue", "issue", source.Number, "error", err)
+		return false
+	}
+	c.log.Info("owner-death: reopened source issue", "issue", source.Number)
+	return true
 }
 
 // escalateDeadOwnerSource holds the source issue for manual review instead
 // of re-arming, because its retry budget is already exhausted — re-arming
 // here would silently bypass the retry-exhausted ceiling.
 func (c *Controller) escalateDeadOwnerSource(ctx context.Context, source *github.Issue, reasonMsg string) {
+	// GH-17: same reopen concern as rearmDeadOwnerSource — a source closed
+	// for a fix-issue takeover must come back open here too, or "holding for
+	// manual review" parks it somewhere a human reviewing pilot-needs-human
+	// issues will never see it (closed issues don't show in the default
+	// open-issues view).
+	reopened := reopenSourceIfClosed(ctx, c, source)
 	if err := c.labeler.AddLabels(ctx, c.owner, c.repo, source.Number, []string{labelNeedsHuman}); err != nil {
 		c.log.Warn("owner-death: failed to add needs-human label", "issue", source.Number, "error", err)
 	}
+	reopenNote := ""
+	if reopened {
+		reopenNote = " and reopened"
+	}
 	comment := fmt.Sprintf(
-		"\U0001F6A8 **Owner-death recovery**: %s, and its retries are already exhausted. Holding for manual review (`%s`).",
-		reasonMsg, labelNeedsHuman,
+		"\U0001F6A8 **Owner-death recovery**: %s, and its retries are already exhausted. Holding for manual review (`%s`%s).",
+		reasonMsg, labelNeedsHuman, reopenNote,
 	)
 	if _, err := c.ghClient.AddComment(ctx, c.owner, c.repo, source.Number, comment); err != nil {
 		c.log.Warn("owner-death: failed to post escalation comment", "issue", source.Number, "error", err)
 	}
 	c.fireOwnerDeathAlert(source.Number, reasonMsg, "escalated")
-	c.log.Warn("owner-death: source escalated to needs-human, retries exhausted", "source", source.Number, "reason", reasonMsg)
+	c.log.Warn("owner-death: source escalated to needs-human, retries exhausted", "source", source.Number, "reason", reasonMsg, "reopened", reopened)
 }
 
 // fireOwnerDeathAlert emits an owner-death alert on behalf of the controller
