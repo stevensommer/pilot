@@ -677,6 +677,13 @@ autopilot:
   # Default environment used when --env is not specified (default: stage)
   default_environment: "stage"
   # Global autopilot settings
+  # auto_merge: when true (default), a PR that passes CI and clears the
+  # approval gate (require_approval, plus the scope-drift/size-floor/
+  # test-evidence defense-in-depth rails) is merged automatically. When
+  # false, that same PR is left open — CI-passed, approval-satisfied, ready
+  # to merge — for a human to merge manually via the GitHub UI; autopilot
+  # will not merge it. This is an independent gate: both require_approval
+  # and auto_merge must allow a merge for one to happen.
   auto_merge: true
   merge_method: "squash"
   ci_wait_timeout: 30m
