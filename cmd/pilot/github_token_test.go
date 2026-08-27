@@ -12,7 +12,25 @@ import (
 	"github.com/qf-studio/pilot/internal/adapters/github"
 	"github.com/qf-studio/pilot/internal/alerts"
 	"github.com/qf-studio/pilot/internal/config"
+	"github.com/qf-studio/pilot/internal/executor"
+	"github.com/qf-studio/pilot/internal/testutil"
 )
+
+// resetGitHubCredentialProviders clears both executor-level credential
+// providers before and after a test, mirroring resetGitHubTokenTestState's
+// isolation for resolveGitHubToken's own package-level caches. Needed
+// because SetGitCredentialProvider/SetGhCredentialProvider are process-wide
+// singletons (see git_credentials.go), so tests must not leak a provider
+// into unrelated tests.
+func resetGitHubCredentialProviders(t *testing.T) {
+	t.Helper()
+	executor.SetGitCredentialProvider(nil)
+	executor.SetGhCredentialProvider(nil)
+	t.Cleanup(func() {
+		executor.SetGitCredentialProvider(nil)
+		executor.SetGhCredentialProvider(nil)
+	})
+}
 
 // resetGitHubTokenTestState clears env and the memoized gh-CLI cache so each
 // subtest starts from a clean resolution chain.
@@ -298,4 +316,158 @@ func TestValidateGitHubToken_NilAlertsEngineDoesNotPanic(t *testing.T) {
 
 	client := github.NewClientWithBaseURL("dead-token", srv.URL)
 	validateGitHubToken(context.Background(), client, githubTokenSourceNone, nil)
+}
+
+// TestHasExplicitGitHubCredential covers the gating decision
+// installGitHubCredentialProviders (GH-6) uses to decide whether to install
+// the git/gh credential providers at all: only when this project configures
+// its own App or plain-token credential, not when it relies purely on
+// ambient GITHUB_TOKEN env / `gh auth login`.
+func TestHasExplicitGitHubCredential(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *config.Config
+		want bool
+	}{
+		{"nil config", nil, false},
+		{"nil adapters", &config.Config{}, false},
+		{"nil github adapter", &config.Config{Adapters: &config.AdaptersConfig{}}, false},
+		{
+			"github adapter with neither token nor app",
+			&config.Config{Adapters: &config.AdaptersConfig{GitHub: &github.Config{Enabled: true}}},
+			false,
+		},
+		{
+			"plain token configured",
+			&config.Config{Adapters: &config.AdaptersConfig{GitHub: &github.Config{
+				Enabled: true, Token: testutil.FakeGitHubToken,
+			}}},
+			true,
+		},
+		{
+			"app configured",
+			&config.Config{Adapters: &config.AdaptersConfig{GitHub: &github.Config{
+				Enabled: true,
+				App:     &github.AppConfig{AppID: 1, InstallationID: 2, PrivateKeyPath: "/nonexistent.pem"},
+			}}},
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasExplicitGitHubCredential(tt.cfg); got != tt.want {
+				t.Errorf("hasExplicitGitHubCredential() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestInstallGitHubCredentialProviders_NoOpWithoutExplicitCredential
+// verifies GH-6: a project with no adapters.github.app and no
+// adapters.github.token configured gets no provider installed at all,
+// preserving the pre-existing ambient-environment behavior for daemons that
+// never opted into a project-specific credential.
+func TestInstallGitHubCredentialProviders_NoOpWithoutExplicitCredential(t *testing.T) {
+	resetGitHubCredentialProviders(t)
+
+	cfg := &config.Config{Adapters: &config.AdaptersConfig{GitHub: &github.Config{Enabled: true}}}
+	installGitHubCredentialProviders(cfg)
+
+	if executor.HasGitCredentialProvider() {
+		t.Error("expected no git credential provider installed when neither app nor token is configured")
+	}
+	if executor.HasGhCredentialProvider() {
+		t.Error("expected no gh credential provider installed when neither app nor token is configured")
+	}
+}
+
+// TestInstallGitHubCredentialProviders_InstallsForPlainToken is the
+// regression test for GH-6's root cause: before this fix, only
+// adapters.github.app installed a provider, so a project configured with a
+// plain adapters.github.token PAT (no App) got a nil provider on both the
+// git and gh paths and silently fell back to whatever identity the shared
+// ambient `gh` CLI credential store happened to have active.
+func TestInstallGitHubCredentialProviders_InstallsForPlainToken(t *testing.T) {
+	resetGitHubCredentialProviders(t)
+
+	cfg := &config.Config{Adapters: &config.AdaptersConfig{GitHub: &github.Config{
+		Enabled: true, Token: testutil.FakeGitHubToken,
+	}}}
+	installGitHubCredentialProviders(cfg)
+
+	if !executor.HasGitCredentialProvider() {
+		t.Fatal("expected a git credential provider to be installed for a plain-token config")
+	}
+	if !executor.HasGhCredentialProvider() {
+		t.Fatal("expected a gh credential provider to be installed for a plain-token config")
+	}
+}
+
+// TestGithubTokenProviderFunc_TwoDaemonsResolveTheirOwnToken is the
+// GH-6 acceptance test for the multi-daemon scenario: two projects, each
+// with a distinct adapters.github.token, must each resolve their own
+// configured token — never the other project's, and never an ambient
+// GITHUB_TOKEN env value that happens to be sitting in the process
+// environment (standing in, at the unit-test level, for "whichever account
+// happens to be active in the shared `gh` CLI credential store" from the
+// real bug report — since resolveGitHubToken's config-token branch
+// short-circuits before ever consulting the environment or `gh auth
+// token`). Because SetGitCredentialProvider/SetGhCredentialProvider are
+// process-wide singletons, two real daemon processes each running this
+// exact code path is what actually delivers the isolation; see also the
+// manual verification steps in the PR description for the true two-process
+// check this single-binary test cannot fully exercise.
+func TestGithubTokenProviderFunc_TwoDaemonsResolveTheirOwnToken(t *testing.T) {
+	resetGitHubTokenTestState(t)
+	// An ambient GITHUB_TOKEN is deliberately left set to a third, wrong
+	// value — standing in for "some other identity is active in the shared
+	// gh CLI credential store" — to prove neither provider is swayed by it.
+	_ = os.Setenv("GITHUB_TOKEN", "wrong-ambient-token")
+
+	cfgA := &config.Config{Adapters: &config.AdaptersConfig{GitHub: &github.Config{
+		Enabled: true, Token: testutil.FakeGitHubToken,
+	}}}
+	cfgB := &config.Config{Adapters: &config.AdaptersConfig{GitHub: &github.Config{
+		Enabled: true, Token: testutil.FakeGitHubPAT,
+	}}}
+
+	providerA := githubTokenProviderFunc(cfgA)
+	providerB := githubTokenProviderFunc(cfgB)
+
+	tokA, err := providerA(context.Background())
+	if err != nil {
+		t.Fatalf("providerA: unexpected error: %v", err)
+	}
+	if tokA != testutil.FakeGitHubToken {
+		t.Errorf("providerA token = %q, want %q (daemon A's own configured token)", tokA, testutil.FakeGitHubToken)
+	}
+
+	tokB, err := providerB(context.Background())
+	if err != nil {
+		t.Fatalf("providerB: unexpected error: %v", err)
+	}
+	if tokB != testutil.FakeGitHubPAT {
+		t.Errorf("providerB token = %q, want %q (daemon B's own configured token)", tokB, testutil.FakeGitHubPAT)
+	}
+}
+
+// TestGithubTokenProviderFunc_EmptyResolutionReturnsSentinelError verifies
+// the provider surfaces errNoGitHubTokenResolved (rather than a bare empty
+// string with a nil error) when resolveGitHubToken comes up empty, matching
+// withGitCredentials/withGhCredentials's error-or-empty-token fallback
+// branch, which logs loudly on either.
+func TestGithubTokenProviderFunc_EmptyResolutionReturnsSentinelError(t *testing.T) {
+	resetGitHubTokenTestState(t)
+	ghRunner = fakeGhRunner(t, false, "", "", nil)
+
+	cfg := &config.Config{Adapters: &config.AdaptersConfig{GitHub: &github.Config{Enabled: true}}}
+	provider := githubTokenProviderFunc(cfg)
+
+	tok, err := provider(context.Background())
+	if tok != "" {
+		t.Errorf("token = %q, want empty", tok)
+	}
+	if err != errNoGitHubTokenResolved {
+		t.Errorf("err = %v, want errNoGitHubTokenResolved", err)
+	}
 }

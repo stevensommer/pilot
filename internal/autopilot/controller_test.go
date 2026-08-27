@@ -11894,6 +11894,122 @@ func TestHandleCIPassed_SmallInScopePRMerges(t *testing.T) {
 	}
 }
 
+// TestHandleCIPassed_AutoMergeDisabled_LeavesPROpen verifies the fix for the
+// bug where Config.AutoMerge was read only inside log.Info calls and never
+// consulted in a conditional: a CI-passed PR with RequireApproval=false and
+// AutoMerge=false must NOT be routed to StageMerging (and, by extension, must
+// never be merged) — it stays parked at StageCIPassed for a human to merge
+// manually.
+func TestHandleCIPassed_AutoMergeDisabled_LeavesPROpen(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/owner/repo/pulls/80/files" && r.Method == http.MethodGet:
+			files := []*github.PRFile{
+				{Filename: "a.go", Status: "modified", Additions: 50},
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, files))
+		case r.URL.Path == "/repos/owner/repo/issues/52" && r.Method == http.MethodGet:
+			resp := github.Issue{Number: 52, Title: "fix(auth): fix login bug"}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, resp))
+		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/merge"):
+			t.Errorf("unexpected merge request sent while auto_merge is disabled: %s", r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{}"))
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{}"))
+		}
+	}))
+	defer server.Close()
+
+	ghClient := github.NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	cfg := DefaultConfig()
+	cfg.Environment = EnvDev // RequireApproval = false
+	cfg.AutoMerge = false
+
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	prState := &PRState{
+		PRNumber:    80,
+		IssueNumber: 52,
+		// Same type+scope as the issue — no drift, no escalation.
+		PRTitle: "fix(auth): fix login bug",
+		Stage:   StageCIPassed,
+	}
+
+	if err := c.handleCIPassed(context.Background(), prState); err != nil {
+		t.Fatalf("handleCIPassed returned unexpected error: %v", err)
+	}
+	if prState.Stage == StageMerging {
+		t.Errorf("expected PR to NOT advance to StageMerging while auto_merge is disabled, got %v", prState.Stage)
+	}
+	if prState.Stage != StageCIPassed {
+		t.Errorf("expected PR to stay parked at StageCIPassed while auto_merge is disabled, got %v", prState.Stage)
+	}
+	if !prState.Parked {
+		t.Errorf("expected prState.Parked=true while auto_merge is disabled")
+	}
+
+	// A second tick must not re-run the size-floor/scope-drift gates (and
+	// must still refuse to merge) — the early-return guard should short
+	// circuit immediately.
+	if err := c.handleCIPassed(context.Background(), prState); err != nil {
+		t.Fatalf("handleCIPassed (second tick) returned unexpected error: %v", err)
+	}
+	if prState.Stage != StageCIPassed {
+		t.Errorf("expected PR to remain parked at StageCIPassed on second tick, got %v", prState.Stage)
+	}
+}
+
+// TestHandleCIPassed_AutoMergeEnabled_StillMerges is a regression guard for
+// the AutoMerge fix above: with AutoMerge true (the default) and
+// RequireApproval false, a CI-passed PR must still advance to StageMerging —
+// proving the fix didn't make merging never happen.
+func TestHandleCIPassed_AutoMergeEnabled_StillMerges(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/owner/repo/pulls/81/files" && r.Method == http.MethodGet:
+			files := []*github.PRFile{
+				{Filename: "a.go", Status: "modified", Additions: 50},
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, files))
+		case r.URL.Path == "/repos/owner/repo/issues/53" && r.Method == http.MethodGet:
+			resp := github.Issue{Number: 53, Title: "fix(auth): fix login bug"}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, resp))
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{}"))
+		}
+	}))
+	defer server.Close()
+
+	ghClient := github.NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	cfg := DefaultConfig()
+	cfg.Environment = EnvDev // RequireApproval = false
+	cfg.AutoMerge = true     // explicit, though DefaultConfig() already defaults true
+
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	prState := &PRState{
+		PRNumber:    81,
+		IssueNumber: 53,
+		PRTitle:     "fix(auth): fix login bug",
+		Stage:       StageCIPassed,
+	}
+
+	if err := c.handleCIPassed(context.Background(), prState); err != nil {
+		t.Fatalf("handleCIPassed returned unexpected error: %v", err)
+	}
+	if prState.Stage != StageMerging {
+		t.Errorf("expected StageMerging when auto_merge is enabled, got %v", prState.Stage)
+	}
+	if prState.Parked {
+		t.Errorf("expected prState.Parked=false when auto_merge is enabled")
+	}
+}
+
 // GH-3513 wave 2: a merged PR registered under a DECOMPOSED PARENT's issue
 // number must not close the parent while children are open — only the
 // count-verified path may close decomposed parents.
