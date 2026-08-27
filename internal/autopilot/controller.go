@@ -2709,8 +2709,20 @@ func (c *Controller) OnReviewRequested(prNumber int, action, state, reviewer str
 		return
 	}
 
-	// Only act on changes_requested reviews
-	if state != "changes_requested" {
+	// Pilot's own review of its own PR must never trigger the loop, regardless
+	// of trusted_bot_reviewers (GH-5). In practice GitHub already forbids a PR
+	// author from requesting changes on their own PR, but this guard keeps the
+	// exclusion unconditional and symmetric with hasChangesRequested (polling
+	// mode) rather than relying on that platform restriction alone.
+	if isSelfReview(c.getBotLogin(context.Background()), reviewer) {
+		return
+	}
+
+	// Only act on the configured trigger states (default: "changes_requested"
+	// only, matching the original hardcoded check byte-for-byte). GH-5: this
+	// is the same case-insensitive matcher hasChangesRequested (polling mode)
+	// uses, so the two modes agree on which states start a revision cycle.
+	if !c.config.ReviewFeedback.IsTriggerState(state) {
 		return
 	}
 
@@ -4244,8 +4256,33 @@ func (c *Controller) handleReviewRequested(ctx context.Context, prState *PRState
 	return nil
 }
 
-// hasChangesRequested checks if a PR has unresolved "changes requested" reviews.
-// It filters out bot reviews and only considers reviews submitted after the PR was created.
+// isBotReviewer reports whether login looks like an automated reviewer,
+// using the heuristic GitHub bot accounts conventionally follow: a "[bot]"
+// suffix (GitHub Apps, e.g. "dependabot[bot]") or a "-bot" suffix. Shared by
+// hasChangesRequested (polling mode) and OnReviewRequested (webhook mode) so
+// the blanket skip and the trusted_bot_reviewers allowlist can never
+// disagree about what counts as a bot (GH-5).
+func isBotReviewer(login string) bool {
+	return strings.Contains(login, "[bot]") || strings.HasSuffix(login, "-bot")
+}
+
+// isSelfReview reports whether login matches botLogin — Pilot's own
+// authenticated GitHub identity, as resolved by getBotLogin. Pilot must
+// never treat its own review as a trigger for the feedback loop — regardless
+// of trusted_bot_reviewers — since a self-review carries no independent
+// judgement. This is the one exclusion trusted_bot_reviewers can never
+// override (GH-5). A blank botLogin (unresolved) never matches, matching the
+// fail-open behaviour of the other getBotLogin callers.
+func isSelfReview(botLogin, login string) bool {
+	return botLogin != "" && strings.EqualFold(login, botLogin)
+}
+
+// hasChangesRequested checks if a PR has unresolved reviews in one of the
+// configured trigger states (default: "changes_requested" only). It filters
+// out bot reviews unless the bot is explicitly allow-listed via
+// trusted_bot_reviewers, always excludes Pilot's own self-review regardless
+// of that allowlist, and only considers reviews submitted after the PR was
+// created.
 func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState) bool {
 	reviews, err := c.ghClient.ListPullRequestReviews(ctx, c.owner, c.repo, prState.PRNumber)
 	if err != nil {
@@ -4253,11 +4290,22 @@ func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState) 
 		return false
 	}
 
-	// Track latest review state per user (only non-bot users)
+	cfg := c.config.ReviewFeedback
+	botLogin := c.getBotLogin(ctx)
+
+	// Track latest review state per user (only non-bot / trusted-bot users)
 	latestState := make(map[string]string)
 	for _, r := range reviews {
-		// Skip bot reviews (self-review)
-		if strings.Contains(r.User.Login, "[bot]") || strings.HasSuffix(r.User.Login, "-bot") {
+		login := r.User.Login
+
+		// Pilot's own review of its own PR must never trigger the loop,
+		// regardless of trusted_bot_reviewers.
+		if isSelfReview(botLogin, login) {
+			continue
+		}
+
+		// Skip bot reviews unless explicitly allow-listed.
+		if isBotReviewer(login) && !cfg.IsTrustedBotReviewer(login) {
 			continue
 		}
 
@@ -4269,11 +4317,11 @@ func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState) 
 			}
 		}
 
-		latestState[r.User.Login] = r.State
+		latestState[login] = r.State
 	}
 
 	for _, state := range latestState {
-		if state == "CHANGES_REQUESTED" {
+		if cfg.IsTriggerState(state) {
 			return true
 		}
 	}

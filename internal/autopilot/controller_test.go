@@ -6851,6 +6851,236 @@ func TestController_HasChangesRequested_FilterByTime(t *testing.T) {
 	}
 }
 
+// TestReviewFeedbackConfig_IsTriggerState covers GH-5: a nil config, or a
+// config with an empty TriggerStates list, must reproduce the original
+// hardcoded "changes_requested"-only behaviour byte-for-byte. Matching is
+// case-insensitive so callers can pass either the polling REST API's
+// upper-case state or the webhook payload's lower-case state.
+func TestReviewFeedbackConfig_IsTriggerState(t *testing.T) {
+	tests := []struct {
+		name  string
+		cfg   *ReviewFeedbackConfig
+		state string
+		want  bool
+	}{
+		{"nil config, default state upper-case", nil, "CHANGES_REQUESTED", true},
+		{"nil config, default state lower-case", nil, "changes_requested", true},
+		{"nil config, non-default state", nil, "COMMENTED", false},
+		{"empty TriggerStates falls back to default", &ReviewFeedbackConfig{}, "changes_requested", true},
+		{"empty TriggerStates rejects non-default", &ReviewFeedbackConfig{}, "commented", false},
+		{"configured state matches case-insensitively", &ReviewFeedbackConfig{TriggerStates: []string{"commented"}}, "COMMENTED", true},
+		{"configured state list, no match", &ReviewFeedbackConfig{TriggerStates: []string{"commented"}}, "CHANGES_REQUESTED", false},
+		{"configured multi-state list matches second entry", &ReviewFeedbackConfig{TriggerStates: []string{"changes_requested", "commented"}}, "commented", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.IsTriggerState(tt.state); got != tt.want {
+				t.Errorf("IsTriggerState(%q) = %v, want %v", tt.state, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestReviewFeedbackConfig_IsTrustedBotReviewer covers GH-5: a nil config, or
+// a config with an empty TrustedBotReviewers list, must trust no bot —
+// reproducing the original blanket bot skip byte-for-byte.
+func TestReviewFeedbackConfig_IsTrustedBotReviewer(t *testing.T) {
+	tests := []struct {
+		name  string
+		cfg   *ReviewFeedbackConfig
+		login string
+		want  bool
+	}{
+		{"nil config trusts nobody", nil, "ci-bot", false},
+		{"empty allowlist trusts nobody", &ReviewFeedbackConfig{}, "ci-bot", false},
+		{"exact match", &ReviewFeedbackConfig{TrustedBotReviewers: []string{"ci-bot"}}, "ci-bot", true},
+		{"case-insensitive match", &ReviewFeedbackConfig{TrustedBotReviewers: []string{"CI-Bot"}}, "ci-bot", true},
+		{"no match", &ReviewFeedbackConfig{TrustedBotReviewers: []string{"other-bot"}}, "ci-bot", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.IsTrustedBotReviewer(tt.login); got != tt.want {
+				t.Errorf("IsTrustedBotReviewer(%q) = %v, want %v", tt.login, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestController_HasChangesRequested_TrustedBotTriggers covers GH-5: a bot
+// reviewer explicitly allow-listed via trusted_bot_reviewers is no longer
+// skipped outright, and its CHANGES_REQUESTED review starts a revision cycle
+// just like a human reviewer's would.
+func TestController_HasChangesRequested_TrustedBotTriggers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/42/reviews":
+			resp := []*github.PullRequestReview{
+				{ID: 1, User: github.User{Login: "ci-bot"}, State: "CHANGES_REQUESTED", SubmittedAt: "2026-03-05T10:00:00Z"},
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, resp))
+		case "/user":
+			// Pilot's own identity is unrelated to the reviewer in this test.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, github.User{Login: "pilot[bot]"}))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	ghClient := github.NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	cfg := DefaultConfig()
+	cfg.ReviewFeedback = &ReviewFeedbackConfig{
+		Enabled:             true,
+		MaxIterations:       3,
+		TrustedBotReviewers: []string{"ci-bot"},
+	}
+
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc123", "pilot/GH-10", "")
+	c.mu.Lock()
+	c.activePRs[42].CreatedAt = time.Date(2026, 3, 5, 9, 0, 0, 0, time.UTC)
+	c.mu.Unlock()
+
+	prState, _ := c.GetPRState(42)
+	if !c.hasChangesRequested(context.Background(), prState) {
+		t.Error("hasChangesRequested should return true for an allow-listed bot's CHANGES_REQUESTED review")
+	}
+}
+
+// TestController_HasChangesRequested_CustomTriggerState covers GH-5: widening
+// TriggerStates lets a non-CHANGES_REQUESTED review (e.g. COMMENTED, as
+// GitHub Copilot's repo-ruleset review always submits) start a revision
+// cycle for a human reviewer.
+func TestController_HasChangesRequested_CustomTriggerState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/42/reviews":
+			resp := []*github.PullRequestReview{
+				{ID: 1, User: github.User{Login: "alice"}, State: "COMMENTED", SubmittedAt: "2026-03-05T10:00:00Z"},
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, resp))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	ghClient := github.NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	cfg := DefaultConfig()
+	cfg.ReviewFeedback = &ReviewFeedbackConfig{
+		Enabled:       true,
+		MaxIterations: 3,
+		TriggerStates: []string{"commented"},
+	}
+
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc123", "pilot/GH-10", "")
+	c.mu.Lock()
+	c.activePRs[42].CreatedAt = time.Date(2026, 3, 5, 9, 0, 0, 0, time.UTC)
+	c.mu.Unlock()
+
+	prState, _ := c.GetPRState(42)
+	if !c.hasChangesRequested(context.Background(), prState) {
+		t.Error("hasChangesRequested should return true for a COMMENTED review when trigger_states includes 'commented'")
+	}
+}
+
+// TestController_HasChangesRequested_SelfReviewNeverTriggers covers GH-5's
+// hardest requirement: even when Pilot's own bot login is explicitly listed
+// in trusted_bot_reviewers, its own review of its own PR must never start a
+// revision cycle. The allowlist can widen which *other* bots are trusted; it
+// can never re-enable self-review.
+func TestController_HasChangesRequested_SelfReviewNeverTriggers(t *testing.T) {
+	const selfLogin = "pilot[bot]"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/42/reviews":
+			resp := []*github.PullRequestReview{
+				{ID: 1, User: github.User{Login: selfLogin}, State: "CHANGES_REQUESTED", SubmittedAt: "2026-03-05T10:00:00Z"},
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, resp))
+		case "/user":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mustJSON(t, github.User{Login: selfLogin}))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	ghClient := github.NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	cfg := DefaultConfig()
+	cfg.ReviewFeedback = &ReviewFeedbackConfig{
+		Enabled:             true,
+		MaxIterations:       3,
+		TrustedBotReviewers: []string{selfLogin}, // explicitly (mis)trusting Pilot's own login
+	}
+
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc123", "pilot/GH-10", "")
+	c.mu.Lock()
+	c.activePRs[42].CreatedAt = time.Date(2026, 3, 5, 9, 0, 0, 0, time.UTC)
+	c.mu.Unlock()
+
+	prState, _ := c.GetPRState(42)
+	if c.hasChangesRequested(context.Background(), prState) {
+		t.Error("hasChangesRequested must never trigger on Pilot's own self-review, even when trusted_bot_reviewers lists its login")
+	}
+}
+
+// TestController_OnReviewRequested_CustomTriggerState covers GH-5 in webhook
+// mode: a non-"changes_requested" state configured via trigger_states must
+// transition the PR just like webhook mode already does for
+// "changes_requested" by default.
+func TestController_OnReviewRequested_CustomTriggerState(t *testing.T) {
+	ghClient := github.NewClient(testutil.FakeGitHubToken)
+	cfg := DefaultConfig()
+	cfg.ReviewFeedback = &ReviewFeedbackConfig{
+		Enabled:       true,
+		MaxIterations: 3,
+		TriggerStates: []string{"commented"},
+	}
+
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc123", "pilot/GH-10", "")
+
+	c.OnReviewRequested(42, "submitted", "commented", "alice")
+
+	pr, ok := c.GetPRState(42)
+	if !ok {
+		t.Fatal("PR should be tracked")
+	}
+	if pr.Stage != StageReviewRequested {
+		t.Errorf("stage = %s, want %s after a configured 'commented' trigger state", pr.Stage, StageReviewRequested)
+	}
+}
+
+// TestController_OnReviewRequested_DefaultTriggerStateUnchanged covers GH-5's
+// default-preservation requirement: with TriggerStates unset, a "commented"
+// webhook review must NOT transition the PR — exactly today's behaviour.
+func TestController_OnReviewRequested_DefaultTriggerStateUnchanged(t *testing.T) {
+	ghClient := github.NewClient(testutil.FakeGitHubToken)
+	cfg := DefaultConfig()
+	cfg.ReviewFeedback = &ReviewFeedbackConfig{Enabled: true, MaxIterations: 3}
+
+	c := NewController(cfg, ghClient, nil, "owner", "repo")
+	c.OnPRCreated(42, "https://github.com/owner/repo/pull/42", 10, "abc123", "pilot/GH-10", "")
+
+	c.OnReviewRequested(42, "submitted", "commented", "alice")
+
+	pr, ok := c.GetPRState(42)
+	if !ok {
+		t.Fatal("PR should be tracked")
+	}
+	if pr.Stage == StageReviewRequested {
+		t.Error("stage should not become review_requested for a 'commented' review under default trigger_states")
+	}
+}
+
 func TestMaybeCloseParentIssue(t *testing.T) {
 	tests := []struct {
 		name             string

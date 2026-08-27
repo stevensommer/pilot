@@ -519,11 +519,22 @@ orchestrator:
     # sequential mode closes the PR to unblock the queue; any other mode holds it open with pilot-needs-human, branch intact.
     max_ci_fix_iterations: 3  # Set to 0 to disable the limit
 
-    # Review-feedback handling: auto-creates a revision issue on CHANGES_REQUESTED.
+    # Review-feedback handling: auto-creates a revision issue on CHANGES_REQUESTED
+    # (and, optionally, other review states — see trigger_states below).
     review_feedback:
       enabled: true
       # Revision iteration cap, same closure semantics as max_ci_fix_iterations above.
       max_iterations: 3  # Set to 0 to disable the limit
+      # Review states (case-insensitive) that start a revision cycle. Default
+      # (commented out): only changes_requested — byte-for-byte original behaviour.
+      # Widen to reach feedback that never arrives as CHANGES_REQUESTED — e.g. a
+      # ruleset running copilot_code_review only ever submits COMMENTED reviews.
+      # Caution: every matching review advances max_iterations, so set it generously
+      # if you widen this on a repo whose ruleset re-reviews every push.
+      # trigger_states: [changes_requested, commented]
+      # Bot logins (exact, case-insensitive) exempt from the blanket bot-skip filter.
+      # Pilot's own review of its own PR is always excluded regardless of this list.
+      # trusted_bot_reviewers: ["copilot-pull-request-reviewer[bot]"]
 
 # Executor settings
 executor:
