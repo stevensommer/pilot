@@ -39,6 +39,15 @@ func getGitCredentialProvider() GitTokenProvider {
 	return gitCredentialProvider
 }
 
+// HasGitCredentialProvider reports whether a git credential provider is
+// currently installed (SetGitCredentialProvider was last called with a
+// non-nil value) — i.e. whether git push/fetch will authenticate with a
+// project-resolved token rather than the ambient environment. Exposed for
+// startup diagnostics and tests; never exposes the token itself.
+func HasGitCredentialProvider() bool {
+	return getGitCredentialProvider() != nil
+}
+
 // withGitCredentials sets cmd.Env so a `git` remote operation (push, fetch,
 // pull, ls-remote) authenticates over HTTPS with the token from the
 // installed GitTokenProvider, using GIT_ASKPASS to supply x-access-token
