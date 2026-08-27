@@ -683,6 +683,13 @@ autopilot:
   # Default environment used when --env is not specified (default: stage)
   default_environment: "stage"
   # Global autopilot settings
+  # auto_merge: when true (default), a PR that passes CI and clears the
+  # approval gate (require_approval, plus the scope-drift/size-floor/
+  # test-evidence defense-in-depth rails) is merged automatically. When
+  # false, that same PR is left open — CI-passed, approval-satisfied, ready
+  # to merge — for a human to merge manually via the GitHub UI; autopilot
+  # will not merge it. This is an independent gate: both require_approval
+  # and auto_merge must allow a merge for one to happen.
   auto_merge: true
   merge_method: "squash"
   ci_wait_timeout: 30m
@@ -880,16 +887,64 @@ autopilot:
     #                              # active and ALL non-excluded checks gate CI status.
     discovery_grace_period: 60s   # Wait for CI to start
 
-  # Automatic handling of "changes requested" PR reviews (GH-4841): autopilot
-  # spawns a revision issue carrying the review feedback, then closes the
-  # reviewed PR (see max_ci_fix_iterations above for the close-vs-hold gate
-  # on execution.mode) so a fresh PR can pick up the revision issue.
+  # Review-feedback loop (GH-4/GH-5): consumes CHANGES_REQUESTED reviews (and,
+  # optionally, other review states — see trigger_states below) to spawn a
+  # revision issue carrying the feedback. Runs in both polling mode
+  # (hasChangesRequested) and webhook mode (OnReviewRequested);
+  # trigger_states and trusted_bot_reviewers apply identically to both.
+  #
+  # Reaching max_iterations no longer unconditionally closes the PR (GH-4):
+  # under execution.mode: sequential the PR is still closed, to unblock the
+  # sequential poller's queue — but under execution.mode: auto (the default)
+  # it's left open, transitioned to a distinct held stage, for a human to
+  # inspect, continue, or close themselves. See max_ci_fix_iterations above
+  # for the identical close-vs-hold gate on the CI-fix side.
   review_feedback:
     enabled: true
-    max_iterations: 3   # same counting semantics/caveat as max_ci_fix_iterations above —
-                         # they share the same autopilot-meta iteration counter per PR
-                         # lineage, so a lineage that has already used CI-fix rounds has
-                         # that many fewer review-feedback rounds left, and vice versa.
+    # max_iterations limits how many revision issues can be chained before
+    # the close-vs-hold gate above applies. Default: 3. Same counting
+    # semantics/caveat as max_ci_fix_iterations above — they share the same
+    # autopilot-meta iteration counter per PR lineage, so a lineage that has
+    # already used CI-fix rounds has that many fewer review-feedback rounds
+    # left, and vice versa. The counter reflects revision issues *filed*,
+    # not rounds of fixes *completed* — a fix issue filed the moment the
+    # limit is reached still spends the budget before its own fix can land.
+    max_iterations: 3
+    # trigger_states lists the review states (case-insensitive) that start a
+    # revision cycle. Default (commented out below): only "changes_requested"
+    # — reproduces Pilot's original behaviour byte-for-byte.
+    #
+    # Widen this to reach feedback that never arrives as CHANGES_REQUESTED —
+    # e.g. a repository ruleset running `copilot_code_review` with
+    # `review_on_push: true` submits COMMENTED reviews carrying substantive
+    # line-level comments, but never CHANGES_REQUESTED, so the loop can never
+    # fire against it under the default.
+    #
+    # Caution: every review matching a configured trigger state advances
+    # max_iterations, and reaching the limit still triggers the close-vs-hold
+    # gate described above. On a repo whose ruleset re-reviews every push,
+    # widening trigger_states makes that counter advance at the reviewer's
+    # cadence rather than per genuine round of human feedback — set
+    # max_iterations generously if you widen this.
+    # trigger_states: [changes_requested, commented]
+    #
+    # trusted_bot_reviewers is an allowlist of bot logins (exact,
+    # case-insensitive) exempt from the blanket "skip every bot reviewer"
+    # filter (a login containing "[bot]" or ending in "-bot" is treated as a
+    # bot). Default (commented out below): empty — no bot is trusted, so
+    # every bot reviewer is skipped, reproducing Pilot's original behaviour.
+    # Pilot's own review of its own PR is always excluded, regardless of this
+    # list.
+    # trusted_bot_reviewers: ["copilot-pull-request-reviewer[bot]"]
+    #
+    # Note: a review pulls a PR out of awaiting_approval back into
+    # review_requested. That's reasonable for a human reviewer, but on a
+    # human-gated setup (an environment's require_approval: true) it means a
+    # PR parked awaiting an operator's manual merge is no longer at rest once
+    # trigger_states/trusted_bot_reviewers admit automated reviewers — a bot
+    # re-review after the PR is already sitting in awaiting_approval can pull
+    # it back into the revision cycle. Worth knowing before enabling this on
+    # a require_approval environment.
 
   # Test-evidence gate (GH-4329): escalate-only, same pattern as the
   # scope-drift/size-floor gates above. Green CI proves a check concluded

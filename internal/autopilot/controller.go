@@ -2729,8 +2729,20 @@ func (c *Controller) OnReviewRequested(prNumber int, action, state, reviewer str
 		return
 	}
 
-	// Only act on changes_requested reviews
-	if state != "changes_requested" {
+	// Pilot's own review of its own PR must never trigger the loop, regardless
+	// of trusted_bot_reviewers (GH-5). In practice GitHub already forbids a PR
+	// author from requesting changes on their own PR, but this guard keeps the
+	// exclusion unconditional and symmetric with hasChangesRequested (polling
+	// mode) rather than relying on that platform restriction alone.
+	if isSelfReview(c.getBotLogin(context.Background()), reviewer) {
+		return
+	}
+
+	// Only act on the configured trigger states (default: "changes_requested"
+	// only, matching the original hardcoded check byte-for-byte). GH-5: this
+	// is the same case-insensitive matcher hasChangesRequested (polling mode)
+	// uses, so the two modes agree on which states start a revision cycle.
+	if !c.config.ReviewFeedback.IsTriggerState(state) {
 		return
 	}
 
@@ -3279,9 +3291,31 @@ func (c *Controller) requiredCheckMismatchDetail(sha string) (missing, discovere
 	return missing, discovered
 }
 
+// autoMergeDisabledReason is the EscalationReason recorded when handleCIPassed
+// finds the approval gate satisfied (or not required) but Config.AutoMerge is
+// false. Before this fix, AutoMerge was read in exactly two places — both
+// log.Info calls (here and in Run) — and never consulted in a conditional
+// anywhere, so setting auto_merge: false had zero effect: a CI-passed,
+// approval-satisfied PR still merged automatically. Mirrors the
+// Parked+EscalationReason idiom used by parkForBaseMismatch/
+// parkForStackedSuperset, but the PR is held at StageCIPassed rather than
+// StageMerging — nothing about it has begun merging, so StageMerging (with
+// its base-mismatch/stacked-superset guards) would misdescribe it. A human
+// merges it manually via the ordinary GitHub UI whenever they choose.
+const autoMergeDisabledReason = "auto_merge is disabled for this environment/project — PR is ready to merge but held for a human to merge manually"
+
 // handleCIPassed proceeds to merge (with approval if required by environment config
 // or by the scope-drift / size-floor defense-in-depth rails).
 func (c *Controller) handleCIPassed(ctx context.Context, prState *PRState) error {
+	// Already parked because auto_merge is disabled — AutoMerge is a static
+	// per-environment config value, so nothing has changed since the last
+	// tick. Skip straight past the size-floor/scope-drift/test-evidence gates
+	// and their GH API calls rather than re-running them every tick for a PR
+	// that isn't going anywhere until a human merges it manually.
+	if prState.Parked && prState.EscalationReason == autoMergeDisabledReason {
+		return nil
+	}
+
 	// GH-4591: CI passing is the signal that GitHub Actions is running jobs
 	// again — end the current billing-outage alert window so a later,
 	// distinct outage still alerts instead of staying permanently suppressed
@@ -3366,6 +3400,17 @@ func (c *Controller) handleCIPassed(ctx context.Context, prState *PRState) error
 				c.log.Warn("failed to send approval notification", "error", err)
 			}
 		}
+	} else if !c.config.AutoMerge {
+		c.log.Info("auto_merge disabled — CI passed and approval satisfied, but leaving PR unmerged for a human",
+			"pr", prState.PRNumber,
+			"env", c.config.EnvironmentName(),
+		)
+		prState.EscalationReason = autoMergeDisabledReason
+		prState.Parked = true
+		// Stage intentionally stays at StageCIPassed (see the early-return
+		// guard above and autoMergeDisabledReason's doc comment) — this PR
+		// isn't attempting a merge at all, so StageMerging would be
+		// misleading.
 	} else {
 		c.log.Info("proceeding to merge",
 			"pr", prState.PRNumber,
@@ -4231,8 +4276,33 @@ func (c *Controller) handleReviewRequested(ctx context.Context, prState *PRState
 	return nil
 }
 
-// hasChangesRequested checks if a PR has unresolved "changes requested" reviews.
-// It filters out bot reviews and only considers reviews submitted after the PR was created.
+// isBotReviewer reports whether login looks like an automated reviewer,
+// using the heuristic GitHub bot accounts conventionally follow: a "[bot]"
+// suffix (GitHub Apps, e.g. "dependabot[bot]") or a "-bot" suffix. Shared by
+// hasChangesRequested (polling mode) and OnReviewRequested (webhook mode) so
+// the blanket skip and the trusted_bot_reviewers allowlist can never
+// disagree about what counts as a bot (GH-5).
+func isBotReviewer(login string) bool {
+	return strings.Contains(login, "[bot]") || strings.HasSuffix(login, "-bot")
+}
+
+// isSelfReview reports whether login matches botLogin — Pilot's own
+// authenticated GitHub identity, as resolved by getBotLogin. Pilot must
+// never treat its own review as a trigger for the feedback loop — regardless
+// of trusted_bot_reviewers — since a self-review carries no independent
+// judgement. This is the one exclusion trusted_bot_reviewers can never
+// override (GH-5). A blank botLogin (unresolved) never matches, matching the
+// fail-open behaviour of the other getBotLogin callers.
+func isSelfReview(botLogin, login string) bool {
+	return botLogin != "" && strings.EqualFold(login, botLogin)
+}
+
+// hasChangesRequested checks if a PR has unresolved reviews in one of the
+// configured trigger states (default: "changes_requested" only). It filters
+// out bot reviews unless the bot is explicitly allow-listed via
+// trusted_bot_reviewers, always excludes Pilot's own self-review regardless
+// of that allowlist, and only considers reviews submitted after the PR was
+// created.
 func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState) bool {
 	reviews, err := c.ghClient.ListPullRequestReviews(ctx, c.owner, c.repo, prState.PRNumber)
 	if err != nil {
@@ -4240,11 +4310,22 @@ func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState) 
 		return false
 	}
 
-	// Track latest review state per user (only non-bot users)
+	cfg := c.config.ReviewFeedback
+	botLogin := c.getBotLogin(ctx)
+
+	// Track latest review state per user (only non-bot / trusted-bot users)
 	latestState := make(map[string]string)
 	for _, r := range reviews {
-		// Skip bot reviews (self-review)
-		if strings.Contains(r.User.Login, "[bot]") || strings.HasSuffix(r.User.Login, "-bot") {
+		login := r.User.Login
+
+		// Pilot's own review of its own PR must never trigger the loop,
+		// regardless of trusted_bot_reviewers.
+		if isSelfReview(botLogin, login) {
+			continue
+		}
+
+		// Skip bot reviews unless explicitly allow-listed.
+		if isBotReviewer(login) && !cfg.IsTrustedBotReviewer(login) {
 			continue
 		}
 
@@ -4256,11 +4337,11 @@ func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState) 
 			}
 		}
 
-		latestState[r.User.Login] = r.State
+		latestState[login] = r.State
 	}
 
 	for _, state := range latestState {
-		if state == "CHANGES_REQUESTED" {
+		if cfg.IsTriggerState(state) {
 			return true
 		}
 	}
