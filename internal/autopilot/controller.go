@@ -9629,6 +9629,60 @@ func (c *Controller) notifyExternalClose(ctx context.Context, prState *PRState) 
 			// here unconditionally, mirroring escalateAndHold's reverse
 			// direction (needs-human supersedes retry-ready).
 			removeLabels := []string{github.LabelInProgress, labelNeedsManualRebase}
+			// GH-15: pilot-failed by itself does not stop the vendored
+			// studio-sdk poller (poller.go, github.com/qf-studio/studio-sdk)
+			// from blindly re-dispatching this issue under its own number —
+			// shouldRetryFailedIssue only consults state it directly
+			// recognizes (open, not pilot-done, not pilot-title-rejected,
+			// its own in-memory retry budget) and has no notion of "a fix
+			// issue already owns this work." Confirmed live: a four-round
+			// reproduction where the poller won this exact race on every
+			// single round, re-picking the original issue the very next
+			// poll tick after CreateFailureIssue/CreateReviewIssue spawned a
+			// revision issue and this code labeled the source pilot-failed,
+			// because pilot-failed alone left it fully dispatchable.
+			//
+			// The poller's fetchCandidates only ever lists issues carrying
+			// the dispatch label (github.LabelPilot, "pilot") via a
+			// label-scoped ListIssues call — an issue lacking it is
+			// invisible to every retry path in the same pass, which is the
+			// only lever available here without reaching into the vendored
+			// SDK. Only strip it when this close resolved to pilot-failed
+			// AND a durably-claimed fix issue for this exact PR is still
+			// alive: the genuinely-terminal TerminalLabel paths (CI
+			// timeout, iteration limit, consecutive API failures) never
+			// spawn a fix issue, so HasSpawnedFixForPR reports none and
+			// this issue is left pollable exactly as before — it remains
+			// the sole owner of its own retry. Restored by
+			// rearmDeadOwnerSource (owner_death.go) once the designated fix
+			// issue actually dies and the source needs to become pollable
+			// again.
+			hasLiveDesignatedOwner := false
+			if issueLabel == github.LabelFailed && c.stateStore != nil {
+				if fixIssue, ferr := c.stateStore.HasSpawnedFixForPR(c.repoKey(), prState.PRNumber); ferr != nil {
+					c.log.Warn("durable spawned-fix lookup failed while checking blind-retry guard, leaving issue pollable",
+						"pr", prState.PRNumber, "error", ferr)
+				} else if fixIssue > 0 {
+					if fixGH, gerr := c.ghClient.GetIssue(ctx, c.owner, c.repo, fixIssue); gerr != nil {
+						// Fail open: cannot confirm the fix issue is alive,
+						// so don't risk permanently stranding the source
+						// unpollable — leave it retriable, matching the
+						// existing fail-open convention elsewhere in this
+						// function (owner-health check failed, trusting the
+						// claim).
+						c.log.Warn("owner-health check failed while checking blind-retry guard, leaving issue pollable",
+							"pr", prState.PRNumber, "fix_issue", fixIssue, "error", gerr)
+					} else if classifyOwnerHealth(fixGH) != ownerDead {
+						hasLiveDesignatedOwner = true
+					}
+				}
+			}
+			if hasLiveDesignatedOwner {
+				// Strip the dispatch label so the poller's label-scoped
+				// fetchCandidates never surfaces this issue again while its
+				// fix issue is still alive — see the doc comment above.
+				removeLabels = append(removeLabels, github.LabelPilot)
+			}
 			// GH-5115: broaden GH-5099's exhaustion-outranks-close-supersedes-hold
 			// rule (see exhaustedParked above, which only covers the
 			// issueLabel == LabelRetryReady resolution and fully skips this

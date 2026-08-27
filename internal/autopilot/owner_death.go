@@ -223,7 +223,13 @@ func (c *Controller) reactToDeadFixIssue(ctx context.Context, deadIssue *github.
 // re-enters the normal retry ladder, mirroring the relabeling notifyExternalClose
 // already performs for the reactive-close path (controller.go).
 func (c *Controller) rearmDeadOwnerSource(ctx context.Context, source *github.Issue, reasonMsg string) {
-	if err := c.labeler.AddLabels(ctx, c.owner, c.repo, source.Number, []string{github.LabelRetryReady}); err != nil {
+	// GH-15/GH-5032: pilot-retry-ready must always imply pollable — restore
+	// the dispatch label in the same mutation, in case notifyExternalClose's
+	// blind-retry guard stripped it while this source was designated to the
+	// now-dead fix issue (see notifyExternalClose's hasLiveDesignatedOwner
+	// doc comment, controller.go). Mirrors the invariant notifyExternalClose
+	// already enforces for its own retry-ready arming.
+	if err := c.labeler.AddLabels(ctx, c.owner, c.repo, source.Number, []string{github.LabelRetryReady, github.LabelPilot}); err != nil {
 		c.log.Warn("owner-death: failed to add retry-ready label", "issue", source.Number, "error", err)
 	}
 	if err := c.labeler.RemoveLabel(ctx, c.owner, c.repo, source.Number, github.LabelFailed); err != nil {
