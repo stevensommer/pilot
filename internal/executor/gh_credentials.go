@@ -42,6 +42,16 @@ func getGhCredentialProvider() GhTokenProvider {
 	return ghCredentialProvider
 }
 
+// HasGhCredentialProvider reports whether a `gh` CLI credential provider is
+// currently installed (SetGhCredentialProvider was last called with a
+// non-nil value) — i.e. whether `gh` subprocess calls (PR creation, issue
+// comments, label edits) will authenticate with a project-resolved token
+// rather than the ambient environment. Exposed for startup diagnostics and
+// tests; never exposes the token itself.
+func HasGhCredentialProvider() bool {
+	return getGhCredentialProvider() != nil
+}
+
 // withGhCredentials sets cmd.Env so a `gh` CLI subprocess authenticates
 // with the current GitHub App installation token via GITHUB_TOKEN and
 // GH_TOKEN, resolved fresh at spawn time through the installed
