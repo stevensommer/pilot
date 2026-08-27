@@ -215,6 +215,71 @@ func resolveGitHubToken(cfg *config.Config) (string, githubTokenSource) {
 // carrying an empty Authorization header.
 var errNoGitHubTokenResolved = errors.New("no github token resolved (adapters.github.app / adapters.github.token / GITHUB_TOKEN / gh auth token all empty)")
 
+// hasExplicitGitHubCredential reports whether cfg configures a
+// project/daemon-specific GitHub credential — a GitHub App installation
+// (adapters.github.app) or a plain PAT (adapters.github.token) — as opposed
+// to relying purely on the ambient GITHUB_TOKEN env var or a `gh auth
+// login` session for this process. installGitHubCredentialProviders uses
+// this to decide whether to install the git/gh credential providers at all.
+func hasExplicitGitHubCredential(cfg *config.Config) bool {
+	if cfg == nil || cfg.Adapters == nil || cfg.Adapters.GitHub == nil {
+		return false
+	}
+	gh := cfg.Adapters.GitHub
+	return gh.App != nil || gh.Token != ""
+}
+
+// githubTokenProviderFunc builds the shared closure installed as both the
+// git (executor.GitTokenProvider) and gh CLI (executor.GhTokenProvider)
+// credential provider for cfg. It re-resolves cfg's token on every call via
+// resolveGitHubToken's full precedence chain (App -> config token ->
+// GITHUB_TOKEN env -> gh CLI), so git and gh always agree with each other
+// and with the daemon's own API clients (newGitHubClient/newGitHubSDKClient)
+// on the current token, and a rotated/re-minted App token never goes stale.
+func githubTokenProviderFunc(cfg *config.Config) func(ctx context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
+		token, _ := resolveGitHubToken(cfg)
+		if token == "" {
+			return "", errNoGitHubTokenResolved
+		}
+		return token, nil
+	}
+}
+
+// installGitHubCredentialProviders wires the executor's git push/fetch
+// (withGitCredentials) and `gh` CLI subprocess (withGhCredentials) auth to
+// this project's own resolved GitHub credential (GH-6).
+//
+// GH-4743/GH-4746 originally gated this on adapters.github.app being
+// configured, minting only an App installation token. That left any project
+// configured with a plain adapters.github.token PAT (no App) with a nil
+// provider on both paths — so its git-level operations (push, fetch — and,
+// transitively, the pilot-in-progress label-cleanup gh CLI call in
+// lifecycle.go, which already went through this same withGhCredentials
+// seam) silently fell back to withGitCredentials's/withGhCredentials's
+// ambient-environment default: for git, whatever identity happens to be
+// logged into the machine-wide `gh auth git-credential` credential store at
+// push time — not this daemon's own configured token. Two daemons on one
+// machine, each with a different adapters.github.token pointed at a
+// different repo, would silently race on whichever identity an unrelated
+// `gh auth switch` last left active, either 403ing or — worse, when both
+// identities happen to have push access — silently misattributing
+// authorship (GH-6).
+//
+// resolveGitHubToken's own precedence (App first, then config token) means
+// a project with both configured still prefers the App. This is a no-op —
+// both providers stay uninstalled — when neither is configured, so a
+// project relying purely on ambient GITHUB_TOKEN env or a `gh auth login`
+// session keeps exactly its pre-existing behavior.
+func installGitHubCredentialProviders(cfg *config.Config) {
+	if !hasExplicitGitHubCredential(cfg) {
+		return
+	}
+	provider := githubTokenProviderFunc(cfg)
+	executor.SetGitCredentialProvider(provider)
+	executor.SetGhCredentialProvider(provider)
+}
+
 // githubTokenFunc adapts resolveGitHubToken into a github.TokenFunc so a
 // long-lived in-tree GitHub client (autopilot's step-log client, a poll-loop
 // approval handler, the /ready readiness verifier, ...) resolves the current
@@ -2083,28 +2148,11 @@ func runPollingMode(cmd *cobra.Command, cfg *config.Config, projectPath string, 
 	rateBudgetTracker := ghbudget.NewTracker(rateBudgetFloorPct, logging.WithComponent("ghbudget"))
 	http.DefaultTransport = &ghbudget.RoundTripper{Next: http.DefaultTransport, Tracker: rateBudgetTracker}
 
-	// GH-4743: when GitHub App auth is configured, wire pilot worktree git
-	// push/fetch to authenticate with the same minted installation token as
-	// the API clients above, instead of the ambient GITHUB_TOKEN env / gh
-	// CLI credential helper — the SPOF this ticket kills. No-op (nil
-	// provider) when App auth isn't configured, so git commands keep using
-	// the ambient environment exactly as before the cutover.
-	// GH-4746: same cutover, closing the matching gap for `gh` CLI
-	// subprocesses (PR creation, issue comments, label ops) — the daemon's
-	// highest-volume writes, previously left riding the ambient
-	// GITHUB_TOKEN/gh-CLI login even with App auth configured. Both
-	// providers mint through the same mintGitHubAppToken/TokenSource cache,
-	// so git and gh always agree on the current token. No-op (nil provider)
-	// when App auth isn't configured, matching the git provider above.
-	if cfg.Adapters.GitHub != nil && cfg.Adapters.GitHub.App != nil {
-		appCfg := cfg.Adapters.GitHub.App
-		executor.SetGitCredentialProvider(func(ctx context.Context) (string, error) {
-			return mintGitHubAppToken(ctx, appCfg)
-		})
-		executor.SetGhCredentialProvider(func(ctx context.Context) (string, error) {
-			return mintGitHubAppToken(ctx, appCfg)
-		})
-	}
+	// GH-6: wire pilot worktree git push/fetch and `gh` CLI subprocesses to
+	// authenticate with this project's own resolved GitHub credential,
+	// instead of the ambient GITHUB_TOKEN env / gh CLI credential helper —
+	// see installGitHubCredentialProviders for the full rationale.
+	installGitHubCredentialProviders(cfg)
 
 	// Check Telegram config if enabled
 	hasTelegram := cfg.Adapters.Telegram != nil && cfg.Adapters.Telegram.Enabled
