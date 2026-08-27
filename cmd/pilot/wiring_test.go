@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -662,6 +663,105 @@ func TestNewProjectQualityCheckerFactory_AutoDetectsGoProject(t *testing.T) {
 	}
 	if checker == nil {
 		t.Fatal("expected a non-nil checker")
+	}
+}
+
+// TestNewProjectQualityCheckerFactory_ResolvesAcrossWorktree is the GH-3716
+// worktree-resolution regression test: quality gate resolution must work
+// for a task executing in an isolated worktree, which is Pilot's default
+// execution mode (use_worktree: true). Before this fix,
+// newProjectQualityCheckerFactory looked the project up via
+// cfg.FindProjectByPath(executionPath) — raw string equality against the
+// registered project's Path — which a worktree path never satisfies, so
+// every worktree execution silently fell through to
+// quality.AutoDetectConfig against the worktree instead of the project's
+// configured gate.
+//
+// The registered project's quality block here (a single gate named
+// "configured-gate" that always fails) is deliberately distinguishable
+// from whatever AutoDetectConfig would synthesize for an empty directory
+// (a disabled config, short-circuited as passed) — so a passing outcome
+// here would mean the fix regressed back to resolving nothing.
+func TestNewProjectQualityCheckerFactory_ResolvesAcrossWorktree(t *testing.T) {
+	tmp := t.TempDir()
+	mainRepo := filepath.Join(tmp, "main")
+	worktree := filepath.Join(tmp, "pilot-worktree-GH-9001")
+
+	mustGit(t, "", "init", "-q", mainRepo)
+	mustGit(t, mainRepo, "commit", "--allow-empty", "-m", "init", "-q")
+	mustGit(t, mainRepo, "worktree", "add", "--detach", "-q", worktree, "HEAD")
+
+	cfg := &config.Config{
+		Projects: []*config.ProjectConfig{
+			{
+				Name: "worktree-project",
+				Path: mainRepo,
+				Quality: &quality.Config{
+					Enabled: true,
+					Gates:   []*quality.Gate{{Name: "configured-gate", Type: quality.GateBuild, Command: "false", Required: true}},
+				},
+			},
+		},
+	}
+
+	factory := newProjectQualityCheckerFactory(cfg)
+	// Dispatch as the runner does: task.ID plus the ephemeral execution
+	// path, NOT the project's configured Path.
+	checker := factory("task-1", worktree)
+
+	outcome, err := checker.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	if outcome.Passed {
+		t.Fatal("expected the configured single-gate quality block (command: false) to run and fail; a passing outcome means resolution fell through to auto-detect instead of the registered project's config")
+	}
+	if len(outcome.GateDetails) != 1 || outcome.GateDetails[0].Name != "configured-gate" {
+		t.Fatalf("expected the configured gate %q to have run, got gate details: %+v", "configured-gate", outcome.GateDetails)
+	}
+}
+
+// TestNewProjectQualityCheckerFactory_UnrelatedCloneDoesNotAlias preserves
+// the GH-3050 guarantee for the quality-gate resolution path: an unrelated
+// clone of the same upstream repo, checked out at a different,
+// unregistered path, must NOT resolve to a registered project's quality
+// config just because it shares history/content. Only a genuine worktree
+// of the registered checkout (sharing its git common-dir) should match.
+func TestNewProjectQualityCheckerFactory_UnrelatedCloneDoesNotAlias(t *testing.T) {
+	tmp := t.TempDir()
+	mainRepo := filepath.Join(tmp, "main")
+	unrelatedClone := filepath.Join(tmp, "unrelated-clone")
+
+	mustGit(t, "", "init", "-q", mainRepo)
+	mustGit(t, mainRepo, "commit", "--allow-empty", "-m", "init", "-q")
+	mustGit(t, "", "init", "-q", unrelatedClone)
+	mustGit(t, unrelatedClone, "commit", "--allow-empty", "-m", "init", "-q")
+
+	cfg := &config.Config{
+		Projects: []*config.ProjectConfig{
+			{
+				Name: "worktree-project",
+				Path: mainRepo,
+				Quality: &quality.Config{
+					Enabled: true,
+					Gates:   []*quality.Gate{{Name: "configured-gate", Type: quality.GateBuild, Command: "false", Required: true}},
+				},
+			},
+		},
+	}
+
+	factory := newProjectQualityCheckerFactory(cfg)
+	checker := factory("task-1", unrelatedClone)
+
+	outcome, err := checker.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+	// unrelatedClone has no detectable build command, so AutoDetectConfig
+	// yields a disabled config, which Check() short-circuits as passed —
+	// the opposite of what the registered project's failing gate would do.
+	if !outcome.Passed {
+		t.Fatal("expected an unrelated clone at an unregistered path to fall back to auto-detect (passed), not alias the registered project's failing gate")
 	}
 }
 
