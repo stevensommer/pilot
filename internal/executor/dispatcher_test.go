@@ -2674,6 +2674,63 @@ func TestRunStaleRecoveryLoop_Periodic(t *testing.T) {
 	}
 }
 
+// TestRunStaleRecoveryLoop_ReapsOrphanedClaimPeriodically is GH-5301's core
+// acceptance case: the row-less-claim reaper (GH-5273/#5274) must fire on
+// the periodic tick, not only at Dispatcher.Start — an orphaned claim
+// created *after* boot must be reaped within one grace window + one tick,
+// with no daemon restart involved. Before this fix's test coverage existed,
+// every ReapOrphanedClaims test called dispatcher.reapOrphanedClaims()
+// directly, which exercises the query but never proves the ticker
+// (runStaleRecoveryLoop) actually drives it end to end — this test starts
+// the real dispatcher, waits for it to be running, only then creates the
+// orphaned claim, and asserts it disappears without ever calling Stop/Start
+// again. Mirrors TestRunStaleRecoveryLoop_Periodic's structure exactly.
+func TestRunStaleRecoveryLoop_ReapsOrphanedClaimPeriodically(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	// Very short interval and grace window so the loop ticks quickly and the
+	// claim is already past its grace window by the time it does.
+	config := &DispatcherConfig{
+		StaleRunningThreshold:    0,
+		StaleQueuedThreshold:     0,
+		StaleRecoveryInterval:    50 * time.Millisecond,
+		OrphanedClaimGraceWindow: 5 * time.Millisecond,
+	}
+	runner := NewRunner()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dispatcher := NewDispatcher(store, runner, config)
+	if err := dispatcher.Start(ctx); err != nil {
+		t.Fatalf("failed to start dispatcher: %v", err)
+	}
+	defer dispatcher.Stop()
+
+	// Create the orphaned claim AFTER Start() — simulating GH-257's shape,
+	// where the claim is created while the daemon is already running, long
+	// after any boot-time sweep has come and gone.
+	time.Sleep(20 * time.Millisecond)
+	claimed, err := store.ClaimExecution("GH-257", "/project", 0, "exec-gh257-orphan")
+	if err != nil || !claimed {
+		t.Fatalf("expected orphan claim to win, claimed=%v err=%v", claimed, err)
+	}
+
+	// Wait for the periodic loop to tick past the grace window and reap it —
+	// no restart, no direct reapOrphanedClaims() call.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, found, err := store.LatestClaimGeneration("GH-257", "/project"); err != nil {
+			t.Fatalf("LatestClaimGeneration failed: %v", err)
+		} else if !found {
+			return // reaped
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("expected the periodic stale-recovery loop to reap the orphaned claim created after Start(), but it was never reaped")
+}
+
 func TestRecoverStaleTasks_DeletesOrphanWhenCompleted(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -6211,5 +6268,203 @@ func TestDispatcher_QueueDecomposedTask_ClaimLostDropsSilently(t *testing.T) {
 	}
 	if exec.TaskID != parent.ID {
 		t.Errorf("expected winning execution to belong to %q, got %q", parent.ID, exec.TaskID)
+	}
+}
+
+// TestDispatcher_ReapOrphanedClaims_UnwedgesDispatch is the dispatcher-level
+// acceptance test for GH-5273: a claim whose owner died before ever writing
+// the executions row (ExecutionLifecycle.Begin's ClaimExecution-then-
+// SaveExecution window) must not wedge dispatch forever. It uses a
+// deliberately tiny OrphanedClaimGraceWindow plus a short sleep instead of
+// backdating the claim's created_at directly — the SQL-level backdating
+// helper (backdateClaim) lives in internal/memory's test file and is
+// unexported, so it isn't reachable from this package; aging the claim in
+// real time sidesteps that boundary entirely.
+//
+// Claiming generation 0 again (not generation 1) after the reap is the part
+// that actually proves the row was removed rather than merely bypassed —
+// nextRetryGeneration's existing dangling-claim fallthrough (GH-4409) can
+// independently grant a fresh generation for a dead claim, so a naive
+// "dispatch eventually succeeds" assertion alone wouldn't isolate the
+// reaper's own effect from that pre-existing path.
+func TestDispatcher_ReapOrphanedClaims_UnwedgesDispatch(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	runner := NewRunner()
+	config := DefaultDispatcherConfig()
+	config.OrphanedClaimGraceWindow = 10 * time.Millisecond
+	dispatcher := NewDispatcher(store, runner, config)
+
+	var buf bytes.Buffer
+	dispatcher.log = slog.New(slog.NewTextHandler(&buf, nil))
+
+	if err := dispatcher.Start(context.Background()); err != nil {
+		t.Fatalf("failed to start dispatcher: %v", err)
+	}
+	defer dispatcher.Stop()
+
+	ctx := context.Background()
+	task := &Task{
+		ID:          "GH-249",
+		Title:       "orphaned claim regression",
+		ProjectPath: "/tmp/pilot-console-test-project",
+	}
+
+	// Simulate the incident: a claim wins generation 0 but its owner dies
+	// before ever calling SaveExecution — no executions row is ever created.
+	claimed, err := store.ClaimExecution(task.ID, task.ProjectPath, 0, "exec-dead-owner")
+	if err != nil || !claimed {
+		t.Fatalf("expected to seed the orphan claim, claimed=%v err=%v", claimed, err)
+	}
+
+	// Let the claim age past the (deliberately tiny, for this test) grace
+	// window without needing to touch created_at directly.
+	time.Sleep(20 * time.Millisecond)
+
+	// Run the reaper — this is exactly what the periodic stale-recovery tick
+	// calls (recoverStaleTasks -> reapOrphanedClaims).
+	dispatcher.reapOrphanedClaims()
+
+	if !strings.Contains(buf.String(), "GH-5273") || !strings.Contains(buf.String(), "reaped orphaned execution claim") {
+		t.Errorf("expected an info log reporting the reaped claim, got: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "task_id=GH-249") {
+		t.Errorf("expected the reap log to include the claim's task_id, got: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "generation=0") {
+		t.Errorf("expected the reap log to include the claim's generation, got: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "claim_lost_drops=") {
+		t.Errorf("expected the reap log to include the claim_lost_drops count, got: %s", buf.String())
+	}
+
+	// Dispatch must now succeed — the reap removed the row that was
+	// colliding with every retry.
+	execID, err := dispatcher.QueueTask(ctx, task)
+	if err != nil {
+		t.Fatalf("expected dispatch to succeed after the orphan was reaped, got error: %v", err)
+	}
+	if execID == "" {
+		t.Fatal("expected a non-empty execution ID after the orphan was reaped")
+	}
+
+	exec, err := store.GetExecution(execID)
+	if err != nil {
+		t.Fatalf("failed to get execution: %v", err)
+	}
+	if exec.TaskID != task.ID {
+		t.Errorf("expected task ID %s, got %s", task.ID, exec.TaskID)
+	}
+
+	gen, _, found, err := store.LatestClaimGeneration(task.ID, task.ProjectPath)
+	if err != nil {
+		t.Fatalf("LatestClaimGeneration failed: %v", err)
+	}
+	if !found || gen != 0 {
+		t.Errorf("expected the fresh dispatch to claim generation 0 (proving the orphan row was removed, not just bypassed via generation-bump), got gen=%d found=%v", gen, found)
+	}
+}
+
+// TestDispatcher_ReapOrphanedClaims_LeavesFreshClaimWedgedForDuplicatePickup
+// pins the other side of the same acceptance criteria at the dispatcher
+// level: a claim inside the grace window must survive the reap untouched,
+// so an in-flight (not-yet-crashed) owner's duplicate-pickup drop path is
+// unaffected by GH-5273's reaper.
+func TestDispatcher_ReapOrphanedClaims_LeavesFreshClaimWedgedForDuplicatePickup(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	runner := NewRunner()
+	config := DefaultDispatcherConfig()
+	config.OrphanedClaimGraceWindow = 10 * time.Minute
+	dispatcher := NewDispatcher(store, runner, config)
+
+	if err := dispatcher.Start(context.Background()); err != nil {
+		t.Fatalf("failed to start dispatcher: %v", err)
+	}
+	defer dispatcher.Stop()
+
+	task := &Task{
+		ID:          "GH-250",
+		Title:       "fresh claim must not be reaped",
+		ProjectPath: "/tmp/pilot-console-test-project-fresh",
+	}
+
+	claimed, err := store.ClaimExecution(task.ID, task.ProjectPath, 0, "exec-fresh-owner")
+	if err != nil || !claimed {
+		t.Fatalf("expected to seed the fresh claim, claimed=%v err=%v", claimed, err)
+	}
+
+	dispatcher.reapOrphanedClaims()
+
+	gen, execID, found, err := store.LatestClaimGeneration(task.ID, task.ProjectPath)
+	if err != nil {
+		t.Fatalf("LatestClaimGeneration failed: %v", err)
+	}
+	if !found || gen != 0 || execID != "exec-fresh-owner" {
+		t.Fatalf("expected the fresh claim to survive the reap untouched, got gen=%d execID=%q found=%v", gen, execID, found)
+	}
+}
+
+// withFixedLocalOffset temporarily replaces the process-wide time.Local with
+// a fixed positive UTC offset for the duration of the test, restoring it on
+// cleanup. GH-5308: CI and the founder box both run in UTC, so this test's
+// UTC-only sibling above can't distinguish a correctly-UTC-normalized reap
+// cutoff from a buggy local one — the two formats coincide when the host's
+// own zone already is UTC. Forcing a positive offset here reproduces the
+// host class the bug was actually found on (a CEST/+0200 laptop).
+func withFixedLocalOffset(t *testing.T, offsetHours int) {
+	t.Helper()
+	orig := time.Local
+	time.Local = time.FixedZone("test-fixed-offset", offsetHours*3600)
+	t.Cleanup(func() { time.Local = orig })
+}
+
+// TestDispatcher_ReapOrphanedClaims_LeavesFreshClaimWedgedForDuplicatePickup_NonUTCHost
+// is TestDispatcher_ReapOrphanedClaims_LeavesFreshClaimWedgedForDuplicatePickup
+// re-run under a fixed non-UTC time.Local (GH-5308). ReapOrphanedClaims used
+// to bind its grace-window cutoff as `time.Now().Add(-graceWindow)` without
+// normalizing to UTC; execution_claims.created_at is DB-stamped via DEFAULT
+// CURRENT_TIMESTAMP, always UTC text with no offset. On a UTC+ host that
+// mismatch makes a claim created moments ago compare as hours old, so it
+// gets reaped well inside the 10-minute grace window meant to protect a
+// still-live owner from a duplicate dispatch pickup — reproduced here
+// deterministically instead of depending on the test runner's own timezone.
+func TestDispatcher_ReapOrphanedClaims_LeavesFreshClaimWedgedForDuplicatePickup_NonUTCHost(t *testing.T) {
+	withFixedLocalOffset(t, 2)
+
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	runner := NewRunner()
+	config := DefaultDispatcherConfig()
+	config.OrphanedClaimGraceWindow = 10 * time.Minute
+	dispatcher := NewDispatcher(store, runner, config)
+
+	if err := dispatcher.Start(context.Background()); err != nil {
+		t.Fatalf("failed to start dispatcher: %v", err)
+	}
+	defer dispatcher.Stop()
+
+	task := &Task{
+		ID:          "GH-250",
+		Title:       "fresh claim must not be reaped under a non-UTC host clock",
+		ProjectPath: "/tmp/pilot-console-test-project-fresh-nonutc",
+	}
+
+	claimed, err := store.ClaimExecution(task.ID, task.ProjectPath, 0, "exec-fresh-owner")
+	if err != nil || !claimed {
+		t.Fatalf("expected to seed the fresh claim, claimed=%v err=%v", claimed, err)
+	}
+
+	dispatcher.reapOrphanedClaims()
+
+	gen, execID, found, err := store.LatestClaimGeneration(task.ID, task.ProjectPath)
+	if err != nil {
+		t.Fatalf("LatestClaimGeneration failed: %v", err)
+	}
+	if !found || gen != 0 || execID != "exec-fresh-owner" {
+		t.Fatalf("expected the fresh claim to survive the reap untouched under a non-UTC time.Local, got gen=%d execID=%q found=%v", gen, execID, found)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/qf-studio/pilot/internal/adapters/github"
+	"github.com/qf-studio/pilot/internal/executor"
 	"github.com/qf-studio/pilot/internal/gateway"
 	"github.com/qf-studio/pilot/internal/memory"
 )
@@ -1830,6 +1831,30 @@ autopilot:
 	if !strings.Contains(logBuf.String(), "orchestrator.autopilot") {
 		t.Errorf("expected a warning log naming orchestrator.autopilot, got: %q", logBuf.String())
 	}
+
+	// GH-5255: keys the top-level block leaves unset must retain the same
+	// defaults the nested orchestrator.autopilot path gets from
+	// DefaultConfig() — the lift must merge onto the default-populated
+	// struct, not replace it with a fresh zero-value one.
+	ap := config.Orchestrator.Autopilot
+	if ap.MaxFailures != 3 {
+		t.Errorf("Orchestrator.Autopilot.MaxFailures = %d, want 3 (default, unset by top-level block)", ap.MaxFailures)
+	}
+	if ap.MaxMergeAttempts != 5 {
+		t.Errorf("Orchestrator.Autopilot.MaxMergeAttempts = %d, want 5 (default, unset by top-level block)", ap.MaxMergeAttempts)
+	}
+	if ap.MergeMethod != "squash" {
+		t.Errorf("Orchestrator.Autopilot.MergeMethod = %q, want %q (default, unset by top-level block)", ap.MergeMethod, "squash")
+	}
+	if ap.ReviewFeedback == nil || !ap.ReviewFeedback.Enabled {
+		t.Errorf("Orchestrator.Autopilot.ReviewFeedback = %+v, want non-nil with Enabled=true (default, unset by top-level block)", ap.ReviewFeedback)
+	}
+	if !ap.NotifyOnFailure {
+		t.Errorf("Orchestrator.Autopilot.NotifyOnFailure = false, want true (default, unset by top-level block)")
+	}
+	if !ap.AutoCreateIssues {
+		t.Errorf("Orchestrator.Autopilot.AutoCreateIssues = false, want true (default, unset by top-level block)")
+	}
 }
 
 // TestLoadWithTopLevelAndNestedAutopilot covers the case where both a
@@ -2452,6 +2477,124 @@ executor:
 			t.Errorf("MemoryInjection.MaxMemories = %d, want default 5 to survive partial override", cfg.Executor.MemoryInjection.MaxMemories)
 		}
 	})
+}
+
+// TestLoadClaudeCodeEnvPassthrough verifies claude_code.env_passthrough (GH-5277)
+// flows from YAML through Config.Executor into the executor.ClaudeCodeConfig
+// struct that the Claude Code backend spawn reads directly.
+func TestLoadClaudeCodeEnvPassthrough(t *testing.T) {
+	t.Run("defaults to empty when unset", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "config.yaml")
+
+		if err := os.WriteFile(configPath, []byte(`version: "1.0"`), 0644); err != nil {
+			t.Fatalf("Failed to write test config: %v", err)
+		}
+
+		cfg, err := Load(configPath)
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+
+		if cfg.Executor == nil || cfg.Executor.ClaudeCode == nil {
+			t.Fatal("Executor.ClaudeCode should not be nil")
+		}
+		if len(cfg.Executor.ClaudeCode.EnvPassthrough) != 0 {
+			t.Errorf("EnvPassthrough = %v, want empty by default", cfg.Executor.ClaudeCode.EnvPassthrough)
+		}
+	})
+
+	t.Run("explicit names are loaded", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "config.yaml")
+
+		configContent := `
+version: "1.0"
+executor:
+  claude_code:
+    env_passthrough:
+      - MY_REPO_API_KEY
+      - SOME_OTHER_VAR
+`
+		if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+			t.Fatalf("Failed to write test config: %v", err)
+		}
+
+		cfg, err := Load(configPath)
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+
+		if cfg.Executor == nil || cfg.Executor.ClaudeCode == nil {
+			t.Fatal("Executor.ClaudeCode should not be nil")
+		}
+		want := []string{"MY_REPO_API_KEY", "SOME_OTHER_VAR"}
+		got := cfg.Executor.ClaudeCode.EnvPassthrough
+		if len(got) != len(want) {
+			t.Fatalf("EnvPassthrough = %v, want %v", got, want)
+		}
+		for i, name := range want {
+			if got[i] != name {
+				t.Errorf("EnvPassthrough[%d] = %q, want %q", i, got[i], name)
+			}
+		}
+	})
+}
+
+// TestLoadClaudeCodeEnvPassthrough_WiresIntoScrub is the GH-5302 regression
+// guard. TestLoadClaudeCodeEnvPassthrough above only proves env_passthrough
+// parses out of YAML into the Config struct — it says nothing about whether
+// anything downstream actually reads it, and #5277/PR#5288 shipped with
+// SetModelEnvPassthrough having zero production callers despite that test
+// being green. This test walks the real path a daemon (or `pilot task`/
+// `pilot github run`) takes — config.Load, then
+// executor.NewRunnerWithConfig, the single choke point every
+// runner-construction call site funnels through — and asserts the
+// configured name survives modelSubprocessEnv's scrub. Deleting the
+// SetModelEnvPassthrough wiring inside NewRunnerWithConfig fails this test
+// even though TestLoadClaudeCodeEnvPassthrough still passes.
+func TestLoadClaudeCodeEnvPassthrough_WiresIntoScrub(t *testing.T) {
+	executor.SetModelEnvPassthrough(nil)
+	t.Cleanup(func() { executor.SetModelEnvPassthrough(nil) })
+
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configContent := `
+version: "1.0"
+executor:
+  claude_code:
+    env_passthrough:
+      - FOO_API_KEY
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	// This mirrors the daemon startup / CLI wiring: constructing a runner
+	// from the loaded config must, as a side effect, configure the
+	// passthrough set (GH-5302).
+	if _, err := executor.NewRunnerWithConfig(cfg.Executor); err != nil {
+		t.Fatalf("NewRunnerWithConfig failed: %v", err)
+	}
+
+	out := executor.ModelSubprocessEnvForTest([]string{"FOO_API_KEY=x", "LINEAR_API_KEY=still-denied"})
+
+	found := map[string]bool{}
+	for _, kv := range out {
+		name, _, _ := strings.Cut(kv, "=")
+		found[name] = true
+	}
+	if !found["FOO_API_KEY"] {
+		t.Errorf("expected FOO_API_KEY to survive the scrub via claude_code.env_passthrough wired at runner construction, got %v", out)
+	}
+	if found["LINEAR_API_KEY"] {
+		t.Errorf("expected LINEAR_API_KEY (not in env_passthrough) to remain scrubbed, got %v", out)
+	}
 }
 
 func TestResolvedHealthCheckInterval(t *testing.T) {

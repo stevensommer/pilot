@@ -166,8 +166,15 @@ type OrchestratorConfig struct {
 	Model         string            `yaml:"model"`
 	MaxConcurrent int               `yaml:"max_concurrent"`
 	DailyBrief    *DailyBriefConfig `yaml:"daily_brief"`
-	Execution     *ExecutionConfig  `yaml:"execution"`
-	Autopilot     *autopilot.Config `yaml:"autopilot"`
+	// ReceiptsDigest configures the end-of-day per-run cost receipts digest
+	// (GH-5257) — a second, independently-scheduled Telegram brief listing one
+	// line per terminal execution (issue ref, diff size, duration, cost) plus
+	// a day total. Sibling to DailyBrief rather than a generalization of it:
+	// the digest's flat per-execution shape doesn't match Brief's
+	// Completed/InProgress/Blocked sections.
+	ReceiptsDigest *ReceiptsDigestConfig `yaml:"receipts_digest"`
+	Execution      *ExecutionConfig      `yaml:"execution"`
+	Autopilot      *autopilot.Config     `yaml:"autopilot"`
 }
 
 // ExecutionConfig holds settings for task execution mode.
@@ -201,6 +208,18 @@ type DailyBriefConfig struct {
 	Channels []BriefChannelConfig `yaml:"channels"`
 	Content  BriefContentConfig   `yaml:"content"`
 	Filters  BriefFilterConfig    `yaml:"filters"`
+}
+
+// ReceiptsDigestConfig holds settings for the daily receipts digest (GH-5257):
+// an end-of-day Telegram-only summary of per-execution cost receipts, on its
+// own schedule independent of DailyBriefConfig. No Time field (that's a
+// deprecated leftover on DailyBriefConfig) and no Content/Filters — the
+// digest has no content toggles in v1.
+type ReceiptsDigestConfig struct {
+	Enabled  bool                 `yaml:"enabled"`
+	Schedule string               `yaml:"schedule"` // Cron syntax: "0 18 * * *"
+	Timezone string               `yaml:"timezone"`
+	Channels []BriefChannelConfig `yaml:"channels"`
 }
 
 // BriefChannelConfig defines a delivery channel for daily briefs (Slack or email).
@@ -579,6 +598,12 @@ func DefaultConfig() *Config {
 					Projects: []string{},
 				},
 			},
+			ReceiptsDigest: &ReceiptsDigestConfig{
+				Enabled:  false,
+				Schedule: "0 18 * * *", // 6 PM daily
+				Timezone: "America/New_York",
+				Channels: []BriefChannelConfig{},
+			},
 			Execution: DefaultExecutionConfig(),
 			Autopilot: autopilot.DefaultConfig(),
 		},
@@ -864,6 +889,17 @@ func Load(path string) (*Config, error) {
 // with both shapes tells us whether a top-level block is present and
 // whether orchestrator.autopilot was also explicitly set in the same file.
 //
+// The top-level block is probed as a raw yaml.Node rather than decoded
+// straight into *autopilot.Config: decoding into a fresh pointer produces a
+// zero-value struct populated only with the keys the file happens to set,
+// discarding every default DefaultConfig() would otherwise seed (GH-5255).
+// Instead, once presence is confirmed, node.Decode is applied directly onto
+// config.Orchestrator.Autopilot — already populated by DefaultConfig() and,
+// in the nested-only case, further merged by the main Unmarshal above — so
+// yaml.v3 merges just the keys present in the top-level block onto that
+// struct and leaves every unset key at its default, matching the nested
+// path byte-for-byte.
+//
 //   - Top-level only: lift it into orchestrator.autopilot so the documented
 //     snippets (configs/pilot.example.yaml, docs/content/features/autopilot.mdx)
 //     work when copy-pasted verbatim, and warn so the user fixes the nesting.
@@ -873,7 +909,7 @@ func Load(path string) (*Config, error) {
 //   - Neither/nested-only: nothing to do.
 func liftTopLevelAutopilot(expanded string, config *Config) error {
 	var probe struct {
-		Autopilot    *autopilot.Config `yaml:"autopilot"`
+		Autopilot    yaml.Node `yaml:"autopilot"`
 		Orchestrator struct {
 			Autopilot *autopilot.Config `yaml:"autopilot"`
 		} `yaml:"orchestrator"`
@@ -881,7 +917,7 @@ func liftTopLevelAutopilot(expanded string, config *Config) error {
 	if err := yaml.Unmarshal([]byte(expanded), &probe); err != nil {
 		return err
 	}
-	if probe.Autopilot == nil {
+	if probe.Autopilot.IsZero() {
 		return nil
 	}
 	if probe.Orchestrator.Autopilot != nil {
@@ -892,7 +928,12 @@ func liftTopLevelAutopilot(expanded string, config *Config) error {
 	if config.Orchestrator == nil {
 		config.Orchestrator = &OrchestratorConfig{}
 	}
-	config.Orchestrator.Autopilot = probe.Autopilot
+	if config.Orchestrator.Autopilot == nil {
+		config.Orchestrator.Autopilot = autopilot.DefaultConfig()
+	}
+	if err := probe.Autopilot.Decode(config.Orchestrator.Autopilot); err != nil {
+		return err
+	}
 	return nil
 }
 

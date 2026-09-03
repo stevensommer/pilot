@@ -1097,6 +1097,18 @@ func NewRunnerWithConfig(config *BackendConfig) (*Runner, error) {
 			slog.String("type", config.Type),
 		)
 	}
+
+	// GH-5302: this is the single choke point every runner-construction path
+	// (daemon startup, `pilot task`, `pilot github run`, orchestrator,
+	// interactive mode) goes through before any model subprocess can spawn —
+	// wire claude_code.env_passthrough here rather than duplicating the call
+	// across each cmd/pilot call site. Without this, EnvPassthrough parses
+	// from config (GH-5277/PR#5288) but modelSubprocessEnv never sees it and
+	// every listed name is still scrubbed (GH-5302).
+	if config.ClaudeCode != nil {
+		SetModelEnvPassthrough(config.ClaudeCode.EnvPassthrough)
+	}
+
 	backend, err := NewBackend(config)
 	if err != nil {
 		return nil, err
@@ -7225,6 +7237,9 @@ func (r *Runner) getPostExecutionSummary(ctx context.Context, dir string) (*Post
 		"--json-schema", PostExecutionSummarySchema,
 	)
 	cmd.Dir = dir
+	// GH-5278: scrub the ambient environment before this model-controlled
+	// subprocess inherits it.
+	cmd.Env = modelSubprocessEnv(os.Environ())
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -7276,6 +7291,9 @@ func (r *Runner) getContractEvidence(ctx context.Context, dir string, fields []s
 		"--json-schema", ContractEvidenceSchema,
 	)
 	cmd.Dir = dir
+	// GH-5278: scrub the ambient environment before this model-controlled
+	// subprocess inherits it.
+	cmd.Env = modelSubprocessEnv(os.Environ())
 
 	output, err := cmd.Output()
 	if err != nil {

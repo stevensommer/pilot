@@ -6768,7 +6768,7 @@ func TestController_HandleReviewRequested_IgnoresSelfReview(t *testing.T) {
 	c.activePRs[42].CreatedAt = time.Date(2026, 3, 5, 9, 0, 0, 0, time.UTC)
 	c.mu.Unlock()
 
-	result := c.hasChangesRequested(context.Background(), prState)
+	result := c.hasChangesRequested(context.Background(), prState, nil)
 	if result {
 		t.Error("hasChangesRequested should return false for bot-only reviews")
 	}
@@ -6845,7 +6845,7 @@ func TestController_HasChangesRequested_FilterByTime(t *testing.T) {
 	c.mu.Unlock()
 
 	prState, _ := c.GetPRState(42)
-	result := c.hasChangesRequested(context.Background(), prState)
+	result := c.hasChangesRequested(context.Background(), prState, nil)
 	if result {
 		t.Error("hasChangesRequested should return false for reviews submitted before PR creation")
 	}
@@ -6944,7 +6944,7 @@ func TestController_HasChangesRequested_TrustedBotTriggers(t *testing.T) {
 	c.mu.Unlock()
 
 	prState, _ := c.GetPRState(42)
-	if !c.hasChangesRequested(context.Background(), prState) {
+	if !c.hasChangesRequested(context.Background(), prState, nil) {
 		t.Error("hasChangesRequested should return true for an allow-listed bot's CHANGES_REQUESTED review")
 	}
 }
@@ -6983,7 +6983,7 @@ func TestController_HasChangesRequested_CustomTriggerState(t *testing.T) {
 	c.mu.Unlock()
 
 	prState, _ := c.GetPRState(42)
-	if !c.hasChangesRequested(context.Background(), prState) {
+	if !c.hasChangesRequested(context.Background(), prState, nil) {
 		t.Error("hasChangesRequested should return true for a COMMENTED review when trigger_states includes 'commented'")
 	}
 }
@@ -7027,7 +7027,7 @@ func TestController_HasChangesRequested_SelfReviewNeverTriggers(t *testing.T) {
 	c.mu.Unlock()
 
 	prState, _ := c.GetPRState(42)
-	if c.hasChangesRequested(context.Background(), prState) {
+	if c.hasChangesRequested(context.Background(), prState, nil) {
 		t.Error("hasChangesRequested must never trigger on Pilot's own self-review, even when trusted_bot_reviewers lists its login")
 	}
 }

@@ -4283,7 +4283,23 @@ func isSelfReview(botLogin, login string) bool {
 // trusted_bot_reviewers, always excludes Pilot's own self-review regardless
 // of that allowlist, and only considers reviews submitted after the PR was
 // created.
-func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState) bool {
+//
+// ghPR is the caller's already-fetched live PR object (may be nil if the
+// caller's own GetPullRequest fetch failed and it is proceeding fail-open) —
+// GH-5266: it supplies the review-hold cutoff via ghPR.CreatedAt (the PR's
+// real, durable GitHub creation time) in preference to prState.CreatedAt.
+// prState.CreatedAt is set to time.Now() both by OnPRCreated (fresh
+// registration) and by the reconciler's orphan-PR sweep (re-adoption after a
+// daemon restart or an executor callback miss) — so using it as the cutoff
+// blinded the hold exactly when it mattered most: a standing
+// CHANGES_REQUESTED review submitted before a restart became invisible the
+// moment the PR was re-adopted, because every review now looked "older than
+// tracking" (#5263's race/revision-spawn-failure scenario, N1 from the
+// PR#5264 review). Falls back to prState.CreatedAt only when ghPR is nil or
+// its CreatedAt fails to parse, preserving the original no-permanent-park
+// intent (never hold on a review that predates the PR itself) in that
+// degraded case.
+func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState, ghPR *github.PullRequest) bool {
 	reviews, err := c.ghClient.ListPullRequestReviews(ctx, c.owner, c.repo, prState.PRNumber)
 	if err != nil {
 		c.log.Warn("failed to fetch reviews for changes_requested check", "pr", prState.PRNumber, "error", err)
@@ -4293,7 +4309,22 @@ func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState) 
 	cfg := c.config.ReviewFeedback
 	botLogin := c.getBotLogin(ctx)
 
-	// Track latest review state per user (only non-bot / trusted-bot users)
+	cutoff := prState.CreatedAt
+	if ghPR != nil && ghPR.CreatedAt != "" {
+		if parsed, perr := time.Parse(time.RFC3339, ghPR.CreatedAt); perr == nil {
+			cutoff = parsed
+		}
+	}
+
+	// Track latest review state per user (only non-bot / trusted-bot users,
+	// and never Pilot's own self-review). GH-5266 (N2 from the PR#5264
+	// review): a plain "last review wins" map let a later COMMENTED review
+	// from the same reviewer silently clear a standing CHANGES_REQUESTED —
+	// GitHub's own review model does not treat a comment-only review as
+	// superseding a change request, only a fresh APPROVED or an explicit
+	// DISMISSED does. So once a user's latest recorded state is
+	// CHANGES_REQUESTED, only APPROVED/DISMISSED are allowed to overwrite
+	// it; COMMENTED (or any other state) is ignored.
 	latestState := make(map[string]string)
 	for _, r := range reviews {
 		login := r.User.Login
@@ -4310,13 +4341,16 @@ func (c *Controller) hasChangesRequested(ctx context.Context, prState *PRState) 
 		}
 
 		// Only consider reviews submitted after the PR entered tracking
-		if r.SubmittedAt != "" && !prState.CreatedAt.IsZero() {
+		if r.SubmittedAt != "" && !cutoff.IsZero() {
 			submittedAt, err := time.Parse(time.RFC3339, r.SubmittedAt)
-			if err == nil && submittedAt.Before(prState.CreatedAt) {
+			if err == nil && submittedAt.Before(cutoff) {
 				continue
 			}
 		}
 
+		if latestState[login] == "CHANGES_REQUESTED" && r.State != "APPROVED" && r.State != "DISMISSED" {
+			continue
+		}
 		latestState[login] = r.State
 	}
 
@@ -4751,6 +4785,51 @@ func (c *Controller) handleMerging(ctx context.Context, prState *PRState) error 
 		return nil
 	}
 
+	// GH-5263: never attempt to merge a draft PR or one with an outstanding
+	// changes-requested review. Root incident, PR#5258 (2026-08-30): CI went
+	// green, then a REQUEST-CHANGES review landed and the founder-review-flow
+	// drafted the PR + spawned a revision issue (#5261) — but nothing in this
+	// stage checked either signal, so the very next tick called MergePR blind.
+	// verifyCIBeforeMerge only verifies CI; it has no opinion on draft/review
+	// state, so every attempt was a guaranteed GitHub 405 ("still a draft")
+	// that burned the MergeAttempts budget and fed the per-PR circuit breaker
+	// for what was a deliberate, healthy hold — not a failure. On this repo
+	// (no branch protection) the draft flag was ALSO the only thing stopping a
+	// PR carrying an outstanding CHANGES_REQUESTED review from auto-merging
+	// over the reviewer's objection; a race, a manual review without the
+	// revision trigger phrase, or a revision-spawn failure would leave a
+	// non-draft PR with unaddressed feedback exposed to the next green tick.
+	// Both checks below are a plain `return nil` — like the platformBreaker
+	// guard above — not a park via prState.Parked: no label, no alert, no
+	// escalation comment. This is routine review-cycle state, not an incident
+	// requiring human attention, and it self-resolves the moment the PR is
+	// marked ready or re-reviewed/dismissed — both poll-visible fields
+	// re-checked fresh every tick, so no new event plumbing is needed.
+	// MergeAttempts is not incremented and recordPRFailure is never reached
+	// (ProcessPR only calls it when this handler returns a non-nil error), so
+	// neither check can trip the breaker. Fails open on a GetPullRequest
+	// error (mirrors the CI re-validation fail-open just below): a transient
+	// API error must not wedge a legitimate merge forever — the existing
+	// 405-on-draft failure path remains as a backstop, now unreachable in the
+	// common case.
+	ghPRForHold, err := c.ghClient.GetPullRequest(ctx, c.owner, c.repo, prState.PRNumber)
+	if err != nil {
+		c.log.Warn("handleMerging: could not fetch PR to check draft/review hold, proceeding (fail-open)",
+			"pr", prState.PRNumber, "error", err)
+	} else if ghPRForHold.Draft {
+		c.log.Info("handleMerging: PR is a draft — holding merge until marked ready for review",
+			"pr", prState.PRNumber)
+		return nil
+	}
+	// GH-5266: pass the freshly-fetched ghPRForHold (nil on a fail-open fetch
+	// error) through so hasChangesRequested can anchor its review-hold cutoff
+	// on the PR's own GitHub creation time rather than prState.CreatedAt.
+	if c.hasChangesRequested(ctx, prState, ghPRForHold) {
+		c.log.Info("handleMerging: PR has an outstanding changes-requested review — holding merge until re-reviewed or dismissed",
+			"pr", prState.PRNumber)
+		return nil
+	}
+
 	// GH-4477: re-validate CI live at the merge chokepoint instead of trusting
 	// the ci_status frozen by handleCIPassed/handleWaitingCI. Once a PR
 	// reaches StageAwaitApproval, ci_status is never touched again — a
@@ -4893,7 +4972,7 @@ func (c *Controller) handleMerging(ctx context.Context, prState *PRState) error 
 		"method", c.config.MergeMethod,
 	)
 
-	err := c.autoMerger.MergePR(ctx, prState)
+	err = c.autoMerger.MergePR(ctx, prState)
 	if err != nil {
 		c.log.Error("handleMerging: merge failed",
 			"pr", prState.PRNumber,
@@ -8801,7 +8880,12 @@ func (c *Controller) processAllPRs(ctx context.Context) {
 			// Only check PRs that haven't already been transitioned to review_requested.
 			if pr.Stage != StageReviewRequested && pr.Stage != StageFailed &&
 				c.config.ReviewFeedback != nil && c.config.ReviewFeedback.Enabled {
-				if c.hasChangesRequested(ctx, pr) {
+				// GH-5266: ghPR is the same live fetch used above for
+				// checkExternalMergeOrClose/reAdoptHeldRebasePR — reuse it so the
+				// review-hold cutoff anchors on the PR's own GitHub creation time,
+				// which stays correct across a reconciler re-adoption (unlike
+				// pr.CreatedAt, which the reconciler resets to time.Now()).
+				if c.hasChangesRequested(ctx, pr, ghPR) {
 					c.log.Info("detected changes_requested review in polling mode",
 						"pr", pr.PRNumber,
 						"stage", pr.Stage,
@@ -9567,6 +9651,15 @@ func (c *Controller) notifyExternalClose(ctx context.Context, prState *PRState) 
 			// here unconditionally, mirroring escalateAndHold's reverse
 			// direction (needs-human supersedes retry-ready).
 			removeLabels := []string{github.LabelInProgress, labelNeedsManualRebase}
+			// GH-5298: pilot-superseded and pilot must never coexist on an
+			// open issue — pilot-superseded means another run already owns
+			// this scope, so leaving `pilot` standing lets the poller pick
+			// the issue back up and double-dispatch work that is already
+			// spoken for. Strip it in the same mutation that applies
+			// pilot-superseded rather than as a follow-up call.
+			if issueLabel == github.LabelSuperseded {
+				removeLabels = append(removeLabels, github.LabelPilot)
+			}
 			// GH-5115: broaden GH-5099's exhaustion-outranks-close-supersedes-hold
 			// rule (see exhaustedParked above, which only covers the
 			// issueLabel == LabelRetryReady resolution and fully skips this

@@ -709,9 +709,24 @@ func (s *Store) SaveExecution(exec *Execution) error {
 	// The period queries (GetExecutionsInPeriod, GetBriefMetrics) filter on
 	// this column against Go time.Time bounds — letting SQLite pick the
 	// timestamp raced the caller's bounds under load (GH-4332).
+	//
+	// GH-5310: both createdAt and completedAt are normalized to UTC before
+	// binding. completed_at is already only ever written via SQL
+	// `CURRENT_TIMESTAMP` elsewhere (UTC, offset-less text) — see
+	// GetExecutionsForReceipts's GH-5308 note — but callers that hand
+	// SaveExecution a pre-set exec.CompletedAt (tests, migrations) must match
+	// that same on-disk layout, or the two timestamp columns on one row end
+	// up in different zones and any future query joining them is off by the
+	// host's UTC offset.
 	createdAt := exec.CreatedAt
 	if createdAt.IsZero() {
 		createdAt = time.Now()
+	}
+	createdAt = createdAt.UTC()
+	var completedAt *time.Time
+	if exec.CompletedAt != nil {
+		ca := exec.CompletedAt.UTC()
+		completedAt = &ca
 	}
 	return s.withRetry("SaveExecution", func() error {
 		_, err := s.db.Exec(`
@@ -722,7 +737,7 @@ func (s *Store) SaveExecution(exec *Execution) error {
 				task_source_adapter, task_source_issue_id, task_labels,
 				approval_request_id, effort_level, complexity_level, is_canary)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, exec.ID, exec.TaskID, exec.ProjectPath, exec.Status, exec.Output, exec.Error, exec.DurationMs, exec.PRUrl, exec.CommitSHA, createdAt, exec.CompletedAt,
+		`, exec.ID, exec.TaskID, exec.ProjectPath, exec.Status, exec.Output, exec.Error, exec.DurationMs, exec.PRUrl, exec.CommitSHA, createdAt, completedAt,
 			exec.TokensInput, exec.TokensOutput, exec.TokensTotal, exec.TokensCacheRead, exec.TokensCacheWrite,
 			exec.EstimatedCostUSD, exec.FilesChanged, exec.LinesAdded, exec.LinesRemoved, exec.ModelName,
 			exec.TaskTitle, exec.TaskDescription, exec.TaskBranch, exec.TaskBaseBranch, exec.TaskCreatePR, exec.TaskVerbose,
@@ -2072,15 +2087,21 @@ type BriefQuery struct {
 
 // GetExecutionsInPeriod retrieves executions within the specified time range.
 // If query.Projects is non-empty, results are filtered to those projects only.
+//
+// GH-5310: query.Start/End are normalized to UTC before binding — created_at
+// is now always written in UTC (SaveExecution), so an un-normalized local
+// bound would carry a different on-disk text layout than the rows it's being
+// compared against, silently skewing the window by the host's UTC offset.
 func (s *Store) GetExecutionsInPeriod(query BriefQuery) ([]*Execution, error) {
 	var rows *sql.Rows
 	var err error
+	start, end := query.Start.UTC(), query.End.UTC()
 
 	if len(query.Projects) > 0 {
 		// Build placeholders for IN clause
 		placeholders := ""
 		args := make([]interface{}, 0, len(query.Projects)+2)
-		args = append(args, query.Start, query.End)
+		args = append(args, start, end)
 		for i, p := range query.Projects {
 			if i > 0 {
 				placeholders += ","
@@ -2101,7 +2122,7 @@ func (s *Store) GetExecutionsInPeriod(query BriefQuery) ([]*Execution, error) {
 			FROM executions
 			WHERE created_at >= ? AND created_at < ?
 			ORDER BY created_at DESC
-		`, query.Start, query.End)
+		`, start, end)
 	}
 	if err != nil {
 		return nil, err
@@ -2121,6 +2142,67 @@ func (s *Store) GetExecutionsInPeriod(query BriefQuery) ([]*Execution, error) {
 		executions = append(executions, &exec)
 	}
 
+	return executions, rows.Err()
+}
+
+// GetExecutionsForReceipts retrieves terminal (completed or failed) executions
+// whose completed_at falls within the specified time period, for the daily
+// receipts digest (GH-5257 / GH-5261). It windows on completed_at rather than
+// created_at deliberately: a run's cost is only knowable once it finishes, and
+// windowing on created_at let a run started before a digest boundary but
+// finishing after it (still "running" at digest time) fall permanently outside
+// every digest's window (GH-5261 / PR#5258 review). Unlike GetExecutionsInPeriod,
+// it selects the full executionDetailColumns set so callers can read
+// cost/diff-size/source-issue fields, and it excludes canary rows
+// (COALESCE(is_canary,0)=0, matching GetBriefMetrics) so synthetic sandbox runs
+// never contaminate the digest or its totals. Failed rows are included
+// deliberately — a failed run still spent money and the digest marks it as such
+// rather than hiding its cost from the total.
+func (s *Store) GetExecutionsForReceipts(query BriefQuery) ([]*Execution, error) {
+	var args []interface{}
+	whereClause := "WHERE completed_at >= ? AND completed_at < ? AND status IN ('completed', 'failed') AND COALESCE(is_canary, 0) = 0"
+	// GH-5308: completed_at is only ever written as `completed_at =
+	// CURRENT_TIMESTAMP` (grep confirms no UPDATE binds it as a Go param) —
+	// SQLite's own UTC, offset-less text layout. ReceiptsScheduler.runDigest
+	// builds query.Start/End via time.Now().In(loc) using the digest's
+	// configured, non-UTC Timezone (default "America/New_York"), so the same
+	// local-vs-UTC text mismatch ReapOrphanedClaims had applies here too: on
+	// that default config the window silently excludes rows a UTC host would
+	// include (or vice versa, depending on the offset's sign). .UTC() aligns
+	// the bound text layout with completed_at's.
+	args = append(args, query.Start.UTC(), query.End.UTC())
+
+	if len(query.Projects) > 0 {
+		placeholders := ""
+		for i, p := range query.Projects {
+			if i > 0 {
+				placeholders += ","
+			}
+			placeholders += "?"
+			args = append(args, p)
+		}
+		whereClause += " AND project_path IN (" + placeholders + ")"
+	}
+
+	rows, err := s.db.Query(`
+		SELECT `+executionDetailColumns+`
+		FROM executions
+		`+whereClause+`
+		ORDER BY completed_at ASC
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var executions []*Execution
+	for rows.Next() {
+		exec, err := scanExecutionDetail(rows)
+		if err != nil {
+			return nil, err
+		}
+		executions = append(executions, exec)
+	}
 	return executions, rows.Err()
 }
 
@@ -2274,12 +2356,16 @@ func (s *Store) ResolveOrphanedRunningExecution(id, prURL string) error {
 // stalled, rate_limited, infra, superseded, decomposed, canceled) are
 // excluded from the rate denominator. TotalTasks remains COUNT(*) as a
 // volume stat and is NOT the SuccessRate denominator.
+//
+// GH-5310: query.Start/End are normalized to UTC before binding — see
+// GetExecutionsInPeriod's note on why an un-normalized bound skews the
+// window against UTC-written created_at rows.
 func (s *Store) GetBriefMetrics(query BriefQuery) (*BriefMetricsData, error) {
 	var result BriefMetricsData
 
 	var args []interface{}
 	whereClause := "WHERE created_at >= ? AND created_at < ? AND COALESCE(is_canary, 0) = 0"
-	args = append(args, query.Start, query.End)
+	args = append(args, query.Start.UTC(), query.End.UTC())
 
 	if len(query.Projects) > 0 {
 		placeholders := ""
@@ -3385,6 +3471,139 @@ func (s *Store) LatestClaimGeneration(taskID, projectPath string) (generation in
 	return generation, executionID, true, nil
 }
 
+// OrphanedClaim describes one execution_claims row reaped by
+// ReapOrphanedClaims (GH-5273): a claim whose owner died before ever writing
+// the executions row Begin normally saves immediately after winning the
+// claim (ExecutionLifecycle.Begin in internal/executor/lifecycle.go). Unlike
+// GH-4409's dangling-claim fallthrough in nextRetryGeneration — which only
+// helps once a NEW dispatch attempt loses ErrClaimLost against the row —
+// this is the row itself being removed, so a future admission attempt for
+// (TaskID, ProjectPath) claims generation 0 fresh rather than colliding with
+// a permanently row-less claim forever.
+type OrphanedClaim struct {
+	TaskID      string
+	ProjectPath string
+	Generation  int
+	ExecutionID string
+	Age         time.Duration
+}
+
+// ReapOrphanedClaims deletes every execution_claims row older than
+// graceWindow whose claimed execution_id has no matching row in the
+// executions table at all — a claim whose owner crashed between winning
+// ClaimExecution and the immediately-following SaveExecution (GH-5273 live
+// incident: a generation-0 claim survived with no execution row behind it,
+// so every subsequent dispatch attempt's INSERT OR IGNORE collided with it
+// and dropped as "dispatch claim lost", 67 times over ~18 hours, with no
+// existing recovery mechanism able to see it — the stalled re-arm sweep
+// (GH-5212) and nextRetryGeneration's dangling-claim fallthrough (GH-4409)
+// both key off ledger/execution-row evidence that, by construction, does not
+// exist for this class).
+//
+// The grace window guards the legitimate claim-then-write race
+// (ClaimExecution succeeds, SaveExecution follows within the same call —
+// normally microseconds): a claim younger than graceWindow may simply be
+// mid-write, not orphaned, so it is left alone regardless of whether its
+// execution row exists yet. A claim whose (task_id, generation) DOES have a
+// matching executions row — running, queued, or any terminal status — is
+// never selected here regardless of age; only a claim with literally no
+// execution row is a candidate, matching Begin's own claim-then-immediately-
+// save contract (see ExecutionLifecycle.Begin's doc comment).
+//
+// GH-5301: the match uses a correlated NOT EXISTS rather than
+// `execution_id NOT IN (SELECT id FROM executions)` deliberately. SQL's
+// three-valued logic makes NOT IN poison itself the moment the subquery
+// produces even one NULL: `x NOT IN (a, NULL)` evaluates to NULL (not true)
+// for every x that doesn't literally equal a, so a single NULL id anywhere
+// in the executions table would silently turn this reap into a permanent
+// no-op for every claim, forever, with no error surfaced (executions.id is
+// TEXT PRIMARY KEY, which SQLite does not implicitly enforce NOT NULL on
+// for non-INTEGER primary keys — a NULL row there is not the schema's
+// design intent, but nothing today would reject one on insert). NOT EXISTS
+// is immune to this: it is a per-row correlated check, so it correctly
+// reaps a claim regardless of what is or isn't in other rows of the
+// executions table, and independently covers a claim whose own
+// execution_id is empty — that also never matches, so it reaps exactly the
+// same as before. GH-257 (pilot-console): a claim created at admission with
+// no execution row ever written sat unreaped for 27+ hours despite the
+// periodic sweep ticking every StaleRecoveryInterval; this closes any
+// codepath through which that could reproduce.
+//
+// Returns the reaped claims (possibly empty) for the caller to log —
+// deletion already happened by the time this returns.
+func (s *Store) ReapOrphanedClaims(graceWindow time.Duration) ([]OrphanedClaim, error) {
+	// GH-5308: execution_claims.created_at is DATETIME DEFAULT CURRENT_TIMESTAMP
+	// (ClaimExecution never stamps it itself — see backdateClaim's comment in
+	// store_test.go), which SQLite/the DSN's _time_format=sqlite driver write
+	// as a UTC, offset-less text value ("2026-09-03 15:32:50"). A bare
+	// time.Now() cutoff is bound in the *local* zone with its offset appended
+	// ("2026-09-03 17:32:50+02:00" on a UTC+2 host), and `WHERE created_at <
+	// ?` is a plain SQLite TEXT/BINARY-collation comparison, not a
+	// timezone-aware one. On a host east of UTC that comparison makes every
+	// claim look hours older than it is, so a claim created moments ago reaps
+	// as soon as this runs, inside the grace window meant to protect it (the
+	// live class of bug this method exists to close, just misapplied to a
+	// still-live owner instead of a dead one). .UTC() makes the bound value's
+	// text layout match CURRENT_TIMESTAMP's own, restoring correct
+	// chronological ordering. See store.go's filterAndSortStale for the
+	// sibling pattern (GH-4392) of a Go-time-vs-driver-text mismatch, and this
+	// package's TestReapOrphanedClaims_LeavesFreshClaimAlone /
+	// internal/executor's TestDispatcher_ReapOrphanedClaims_LeavesFreshClaimWedgedForDuplicatePickup
+	// for the regression coverage under a fixed non-UTC time.Local.
+	cutoff := time.Now().Add(-graceWindow).UTC()
+
+	rows, err := s.db.Query(`
+		SELECT task_id, project_path, generation, execution_id, created_at
+		FROM execution_claims ec
+		WHERE created_at < ?
+		AND NOT EXISTS (SELECT 1 FROM executions e WHERE e.id = ec.execution_id)
+	`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("querying orphaned claims: %w", err)
+	}
+
+	type claimKey struct {
+		taskID      string
+		projectPath string
+		generation  int
+	}
+	var orphans []OrphanedClaim
+	var keys []claimKey
+	for rows.Next() {
+		var taskID, projectPath, executionID string
+		var generation int
+		var createdAt time.Time
+		if err := rows.Scan(&taskID, &projectPath, &generation, &executionID, &createdAt); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scanning orphaned claim: %w", err)
+		}
+		orphans = append(orphans, OrphanedClaim{
+			TaskID:      taskID,
+			ProjectPath: projectPath,
+			Generation:  generation,
+			ExecutionID: executionID,
+			Age:         time.Since(createdAt),
+		})
+		keys = append(keys, claimKey{taskID: taskID, projectPath: projectPath, generation: generation})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterating orphaned claims: %w", err)
+	}
+	_ = rows.Close()
+
+	for _, k := range keys {
+		if _, err := s.db.Exec(`
+			DELETE FROM execution_claims
+			WHERE task_id = ? AND project_path = ? AND generation = ?
+		`, k.taskID, k.projectPath, k.generation); err != nil {
+			return orphans, fmt.Errorf("deleting orphaned claim (task=%s, project=%s, generation=%d): %w", k.taskID, k.projectPath, k.generation, err)
+		}
+	}
+
+	return orphans, nil
+}
+
 // GetRepickBackoff returns the persisted repick-backoff cooldown state for
 // key (a "project_path|task_id" string minted by cmd/pilot's
 // repickBackoffKey). found is false when no drop has ever been recorded for
@@ -3962,10 +4181,14 @@ func (s *Store) GetOrCreateDailySession() (*Session, error) {
 
 	if err == sql.ErrNoRows {
 		// Create new session for today
+		// GH-5310: StartedAt is stamped in UTC — EndSession writes ended_at via
+		// SQL CURRENT_TIMESTAMP (UTC), so a local-zone StartedAt would leave
+		// this row in the same mixed-zone state the executions table had
+		// before this fix (started_at/ended_at differing by the host offset).
 		session = Session{
 			ID:        fmt.Sprintf("session-%s-%d", today, time.Now().UnixNano()),
 			Date:      today,
-			StartedAt: time.Now(),
+			StartedAt: time.Now().UTC(),
 		}
 		err = s.withRetry("GetOrCreateDailySession", func() error {
 			_, err := s.db.Exec(`
@@ -4171,7 +4394,12 @@ type WindowedStats struct {
 // that project are counted. See WindowedStats for the exact population and
 // neutral-status handling. GH-4735: replaces lifetime headline numbers,
 // which blend model eras and mismatch aggregate populations.
+//
+// GH-5310: since is normalized to UTC before binding — see
+// GetExecutionsInPeriod's note on why an un-normalized bound skews the
+// window against UTC-written created_at rows.
 func (s *Store) GetWindowedStats(projectPath string, since time.Time) (WindowedStats, error) {
+	since = since.UTC()
 	const cols = `
 		SELECT
 			COALESCE(SUM(estimated_cost_usd), 0),
@@ -4851,10 +5079,16 @@ type AutopilotMetricsRow struct {
 }
 
 // SaveAutopilotMetrics persists an autopilot metrics snapshot to SQLite.
+//
+// GH-5310: row.SnapshotAt is normalized to UTC at bind time so callers don't
+// each have to remember to do it — PruneAutopilotMetrics's cutoff and
+// GetLatestAutopilotMetrics's ORDER BY snapshot_at both assume the column is
+// uniformly UTC on disk.
 func (s *Store) SaveAutopilotMetrics(row *AutopilotMetricsRow) error {
 	tokensJSON := marshalMapJSON(row.TokensConsumed)
 	costJSON := marshalMapJSON(row.ExecutionCostUSD)
 	execsJSON := marshalMapJSON(row.ExecutionsByResult)
+	snapshotAt := row.SnapshotAt.UTC()
 
 	return s.withRetry("SaveAutopilotMetrics", func() error {
 		_, err := s.db.Exec(`
@@ -4866,7 +5100,7 @@ func (s *Store) SaveAutopilotMetrics(row *AutopilotMetricsRow) error {
 				tokens_consumed_json, execution_cost_usd_json, executions_by_result_json
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
-			row.SnapshotAt,
+			snapshotAt,
 			row.IssuesSuccess, row.IssuesFailed, row.IssuesRateLimited,
 			row.PRsMerged, row.PRsFailed, row.PRsConflicting,
 			row.CircuitBreakerTrips, row.APIErrorsTotal, row.APIErrorRate,
@@ -4952,8 +5186,12 @@ func (s *Store) LatestAutopilotMetrics() (*AutopilotMetricsRow, error) {
 // PruneExecutionLogs deletes execution log entries older than the given duration.
 // Returns the number of rows deleted. Runs a WAL checkpoint after a large
 // prune (>1000 rows) to reclaim disk space promptly.
+//
+// GH-5310: cutoff is stamped in UTC — execution_logs.timestamp is now always
+// written in UTC (SaveLogEntry), so a local-zone cutoff would carry a
+// different on-disk text layout and skew which rows compare as "older than".
 func (s *Store) PruneExecutionLogs(olderThan time.Duration) (int64, error) {
-	cutoff := time.Now().Add(-olderThan)
+	cutoff := time.Now().UTC().Add(-olderThan)
 	var result sql.Result
 	err := s.withRetry("PruneExecutionLogs", func() error {
 		var execErr error
@@ -4974,8 +5212,13 @@ func (s *Store) PruneExecutionLogs(olderThan time.Duration) (int64, error) {
 }
 
 // PruneAutopilotMetrics deletes snapshots older than the given duration.
+//
+// GH-5310: cutoff is stamped in UTC — autopilot_metrics.snapshot_at is now
+// always written in UTC (SaveAutopilotMetrics), so a local-zone cutoff would
+// carry a different on-disk text layout and skew which rows compare as
+// "older than".
 func (s *Store) PruneAutopilotMetrics(olderThan time.Duration) (int64, error) {
-	cutoff := time.Now().Add(-olderThan)
+	cutoff := time.Now().UTC().Add(-olderThan)
 	var result sql.Result
 	err := s.withRetry("PruneAutopilotMetrics", func() error {
 		var execErr error
@@ -5059,7 +5302,13 @@ type LogEntry struct {
 }
 
 // SaveLogEntry persists an execution log entry and notifies all subscribers.
+//
+// GH-5310: entry.Timestamp is normalized to UTC before binding (and the
+// caller's struct is updated in place, so subscribers fanned out below see
+// the same value that was persisted). PruneExecutionLogs's cutoff assumes
+// the column is uniformly UTC on disk.
 func (s *Store) SaveLogEntry(entry *LogEntry) error {
+	entry.Timestamp = entry.Timestamp.UTC()
 	err := s.withRetry("SaveLogEntry", func() error {
 		result, err := s.db.Exec(`
 			INSERT INTO execution_logs (execution_id, timestamp, level, message, component)
@@ -5171,16 +5420,21 @@ func (s *Store) GetLogsByExecutionID(executionID string, limit int) ([]*LogEntry
 	return entries, nil
 }
 
-// GetLastBriefSent returns the most recent brief record for a given channel.
-// Returns nil if no brief has been sent to the channel.
-func (s *Store) GetLastBriefSent(channel string) (*BriefRecord, error) {
+// GetLastBriefSent returns the most recent brief record for a given channel
+// and brief type. Returns nil if no matching brief has been sent.
+//
+// GH-5257: briefType is a required filter, not just channel — brief_history
+// rows from a second scheduled brief type (e.g. "receipts") on the same
+// Telegram channel would otherwise satisfy a channel-only lookup and corrupt
+// the other brief type's catch-up logic (false catch-up fires / false skips).
+func (s *Store) GetLastBriefSent(channel, briefType string) (*BriefRecord, error) {
 	row := s.db.QueryRow(`
 		SELECT id, sent_at, channel, brief_type, COALESCE(recipient, '')
 		FROM brief_history
-		WHERE channel = ?
+		WHERE channel = ? AND brief_type = ?
 		ORDER BY sent_at DESC
 		LIMIT 1
-	`, channel)
+	`, channel, briefType)
 
 	var record BriefRecord
 	err := row.Scan(&record.ID, &record.SentAt, &record.Channel, &record.BriefType, &record.Recipient)

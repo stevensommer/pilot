@@ -733,6 +733,293 @@ func TestClaimExecution_ProjectScoping(t *testing.T) {
 	}
 }
 
+// withFixedLocalOffset temporarily replaces the process-wide time.Local with
+// a fixed positive UTC offset for the duration of the test, restoring it on
+// cleanup. GH-5308: CI and the founder box both run in UTC, so any comparison
+// that quietly assumes time.Now() is already UTC never turns red there — a
+// self-hoster whose host clock is east of UTC is silently affected instead.
+// This reproduces that host class deterministically no matter which timezone
+// actually runs the test suite (it was found on a CEST/+0200 laptop).
+func withFixedLocalOffset(t *testing.T, offsetHours int) {
+	t.Helper()
+	orig := time.Local
+	time.Local = time.FixedZone("test-fixed-offset", offsetHours*3600)
+	t.Cleanup(func() { time.Local = orig })
+}
+
+// backdateClaim rewrites an execution_claims row's created_at directly via
+// SQL — ClaimExecution always stamps CURRENT_TIMESTAMP, so tests pinning the
+// grace-window boundary need a way to simulate a claim that has actually
+// aged past it.
+//
+// GH-5308: createdAt is normalized with .UTC() before binding. Production
+// never writes this column any other way (CURRENT_TIMESTAMP is always UTC,
+// offset-less text — see ReapOrphanedClaims's own cutoff.UTC() fix), so an
+// un-normalized local time.Time here would make this helper simulate a claim
+// shape that can't occur outside a test running under a fixed non-UTC
+// time.Local, and would misreport reaper behavior on such a host: two
+// distinct real offsets, both explicitly suffixed onto the stored text,
+// don't sort correctly against each other under SQLite's plain
+// BINARY-collation `<` (only offset-less UTC vs the reap cutoff's own
+// .UTC() do).
+func backdateClaim(t *testing.T, store *Store, taskID, projectPath string, generation int, createdAt time.Time) {
+	t.Helper()
+	res, err := store.db.Exec(`
+		UPDATE execution_claims SET created_at = ?
+		WHERE task_id = ? AND project_path = ? AND generation = ?
+	`, createdAt.UTC(), taskID, canonicalizeProjectPath(projectPath), generation)
+	if err != nil {
+		t.Fatalf("backdateClaim: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatalf("backdateClaim: expected to update exactly 1 row, updated %d", n)
+	}
+}
+
+// TestReapOrphanedClaims_RemovesRowlessClaimPastGraceWindow is GH-5273's core
+// acceptance case: a claim whose owner died before ever writing the
+// executions row Begin normally saves right after winning (the live
+// incident's exact shape — a generation-0 claim survived with no execution
+// row behind it, wedging every subsequent dispatch attempt against it
+// forever) is removed once it is older than the grace window.
+func TestReapOrphanedClaims_RemovesRowlessClaimPastGraceWindow(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "pilot-test-*")
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	store, _ := NewStore(tmpDir)
+	defer func() { _ = store.Close() }()
+
+	claimed, err := store.ClaimExecution("GH-249", "/project", 0, "exec-orphan")
+	if err != nil || !claimed {
+		t.Fatalf("expected orphan claim to win, claimed=%v err=%v", claimed, err)
+	}
+	backdateClaim(t, store, "GH-249", "/project", 0, time.Now().Add(-15*time.Minute))
+
+	orphans, err := store.ReapOrphanedClaims(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("ReapOrphanedClaims failed: %v", err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("expected exactly 1 reaped orphan, got %d: %+v", len(orphans), orphans)
+	}
+	if orphans[0].TaskID != "GH-249" || orphans[0].Generation != 0 || orphans[0].ExecutionID != "exec-orphan" {
+		t.Errorf("unexpected reaped claim: %+v", orphans[0])
+	}
+
+	// The row must actually be gone — a fresh claim for the same key must be
+	// able to win generation 0 again.
+	claimed, err = store.ClaimExecution("GH-249", "/project", 0, "exec-fresh")
+	if err != nil {
+		t.Fatalf("ClaimExecution after reap failed: %v", err)
+	}
+	if !claimed {
+		t.Error("expected generation 0 to be claimable again after the orphan was reaped")
+	}
+}
+
+// TestReapOrphanedClaims_LeavesFreshClaimAlone pins the grace-window
+// boundary: a claim younger than graceWindow is never reaped even though it
+// has no execution row yet, since Begin's claim-then-write race is normally
+// microseconds, not minutes — reaping too eagerly would delete a
+// legitimately in-flight claim out from under its own owner.
+func TestReapOrphanedClaims_LeavesFreshClaimAlone(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "pilot-test-*")
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	store, _ := NewStore(tmpDir)
+	defer func() { _ = store.Close() }()
+
+	claimed, err := store.ClaimExecution("GH-250", "/project", 0, "exec-fresh")
+	if err != nil || !claimed {
+		t.Fatalf("expected fresh claim to win, claimed=%v err=%v", claimed, err)
+	}
+	// No backdating: created_at stays at "now", well inside a 10-minute grace
+	// window.
+
+	orphans, err := store.ReapOrphanedClaims(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("ReapOrphanedClaims failed: %v", err)
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("expected fresh claim to survive the reap, got %d reaped: %+v", len(orphans), orphans)
+	}
+
+	// Confirm the row is still there: a second claim for the same key must
+	// still lose.
+	claimed, err = store.ClaimExecution("GH-250", "/project", 0, "exec-other")
+	if err != nil {
+		t.Fatalf("ClaimExecution failed: %v", err)
+	}
+	if claimed {
+		t.Error("expected the fresh claim to still hold generation 0 after the reap")
+	}
+}
+
+// TestReapOrphanedClaims_LeavesFreshClaimAlone_NonUTCHost is
+// TestReapOrphanedClaims_LeavesFreshClaimAlone's assertion re-run under a
+// fixed non-UTC time.Local (GH-5308). execution_claims.created_at is only
+// ever DB-stamped via DEFAULT CURRENT_TIMESTAMP, which SQLite writes as UTC
+// text with no offset; ReapOrphanedClaims's cutoff must be converted to UTC
+// before it's bound, or `WHERE created_at < ?` compares that UTC text
+// against a local-offset-suffixed cutoff and can misjudge a claim created
+// moments ago as hours old. On a UTC test host (CI, the founder box) the
+// original test above can't tell a missing `.UTC()` apart from a correct
+// fix — both a local time.Now() and its .UTC() equivalent format identically
+// when the process's own zone already is UTC. Forcing a positive offset here
+// closes that blind spot: this fails on the pre-fix code and passes once the
+// cutoff is normalized to UTC, regardless of host timezone.
+func TestReapOrphanedClaims_LeavesFreshClaimAlone_NonUTCHost(t *testing.T) {
+	withFixedLocalOffset(t, 2)
+
+	tmpDir, _ := os.MkdirTemp("", "pilot-test-*")
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	store, _ := NewStore(tmpDir)
+	defer func() { _ = store.Close() }()
+
+	claimed, err := store.ClaimExecution("GH-250", "/project", 0, "exec-fresh")
+	if err != nil || !claimed {
+		t.Fatalf("expected fresh claim to win, claimed=%v err=%v", claimed, err)
+	}
+	// No backdating: created_at stays at "now" (DB-side UTC CURRENT_TIMESTAMP),
+	// well inside a 10-minute grace window regardless of the process's zone.
+
+	orphans, err := store.ReapOrphanedClaims(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("ReapOrphanedClaims failed: %v", err)
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("expected fresh claim to survive the reap under a non-UTC time.Local, got %d reaped: %+v", len(orphans), orphans)
+	}
+
+	// Confirm the row is still there: a second claim for the same key must
+	// still lose.
+	claimed, err = store.ClaimExecution("GH-250", "/project", 0, "exec-other")
+	if err != nil {
+		t.Fatalf("ClaimExecution failed: %v", err)
+	}
+	if claimed {
+		t.Error("expected the fresh claim to still hold generation 0 after the reap under a non-UTC time.Local")
+	}
+}
+
+// TestReapOrphanedClaims_LeavesClaimWithExecutionRowAlone verifies existing
+// semantics are unchanged: a claim whose execution_id has a matching
+// executions row — running or terminal — is never reaped regardless of age.
+// This is the vast majority of claims in production; the reaper must only
+// ever touch the narrow row-less class.
+func TestReapOrphanedClaims_LeavesClaimWithExecutionRowAlone(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "pilot-test-*")
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	store, _ := NewStore(tmpDir)
+	defer func() { _ = store.Close() }()
+
+	for i, status := range []string{"running", "failed", "completed"} {
+		taskID := fmt.Sprintf("GH-%d", 300+i)
+		execID := fmt.Sprintf("exec-%d", i)
+
+		claimed, err := store.ClaimExecution(taskID, "/project", 0, execID)
+		if err != nil || !claimed {
+			t.Fatalf("expected claim to win for %s, claimed=%v err=%v", taskID, claimed, err)
+		}
+		backdateClaim(t, store, taskID, "/project", 0, time.Now().Add(-15*time.Minute))
+
+		if err := store.SaveExecution(&Execution{
+			ID:          execID,
+			TaskID:      taskID,
+			ProjectPath: "/project",
+			Status:      status,
+			CreatedAt:   time.Now().Add(-15 * time.Minute),
+		}); err != nil {
+			t.Fatalf("SaveExecution failed for %s: %v", taskID, err)
+		}
+	}
+
+	orphans, err := store.ReapOrphanedClaims(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("ReapOrphanedClaims failed: %v", err)
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("expected no claims reaped when every claim has a matching execution row, got %d: %+v", len(orphans), orphans)
+	}
+}
+
+// TestReapOrphanedClaims_SurvivesNullIDInExecutionsTable is GH-5301's
+// regression case for the `NOT IN` SQL trap: SQL's three-valued logic makes
+// `x NOT IN (SELECT id FROM executions)` evaluate to NULL (not true) for
+// every claim, forever, the moment executions.id contains even one NULL row
+// — executions.id is a TEXT PRIMARY KEY, which SQLite does not implicitly
+// enforce NOT NULL on, so nothing rejects such a row on insert. This pins
+// the fix (a correlated NOT EXISTS instead of NOT IN): a genuine orphaned
+// claim must still be reaped even with a NULL-id row sitting in executions.
+func TestReapOrphanedClaims_SurvivesNullIDInExecutionsTable(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "pilot-test-*")
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	store, _ := NewStore(tmpDir)
+	defer func() { _ = store.Close() }()
+
+	// Plant a NULL-id row directly (SaveExecution's Execution.ID is a plain
+	// Go string and can never be nil, so this bypasses the normal write path
+	// on purpose — it's simulating the schema gap, not a real code path).
+	if _, err := store.db.Exec(`
+		INSERT INTO executions (id, task_id, project_path, status)
+		VALUES (NULL, 'GH-NULLROW', '/project', 'completed')
+	`); err != nil {
+		t.Fatalf("failed to plant NULL-id executions row: %v", err)
+	}
+
+	claimed, err := store.ClaimExecution("GH-257", "/project", 0, "exec-orphan-null-poisoned")
+	if err != nil || !claimed {
+		t.Fatalf("expected orphan claim to win, claimed=%v err=%v", claimed, err)
+	}
+	backdateClaim(t, store, "GH-257", "/project", 0, time.Now().Add(-15*time.Minute))
+
+	orphans, err := store.ReapOrphanedClaims(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("ReapOrphanedClaims failed: %v", err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("expected the orphan to still be reaped despite the NULL-id row in executions, got %d: %+v", len(orphans), orphans)
+	}
+	if orphans[0].TaskID != "GH-257" {
+		t.Errorf("unexpected reaped claim: %+v", orphans[0])
+	}
+}
+
+// TestReapOrphanedClaims_ReapsClaimWithEmptyExecutionID covers a claim row
+// whose execution_id was never a real ID at all — the shape GH-257's own
+// incident produced (created at admission, the run died before Begin's
+// SaveExecution ever ran). execution_claims.execution_id is TEXT NOT NULL,
+// so the column can never hold SQL NULL, but an empty string is the
+// realistic worst case of "no execution row was ever associated" and must
+// be reaped exactly like a claim pointing at a real-but-missing ID.
+func TestReapOrphanedClaims_ReapsClaimWithEmptyExecutionID(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "pilot-test-*")
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	store, _ := NewStore(tmpDir)
+	defer func() { _ = store.Close() }()
+
+	claimed, err := store.ClaimExecution("GH-257", "/project", 0, "")
+	if err != nil || !claimed {
+		t.Fatalf("expected orphan claim to win, claimed=%v err=%v", claimed, err)
+	}
+	backdateClaim(t, store, "GH-257", "/project", 0, time.Now().Add(-15*time.Minute))
+
+	orphans, err := store.ReapOrphanedClaims(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("ReapOrphanedClaims failed: %v", err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("expected the empty-execution_id claim to be reaped, got %d: %+v", len(orphans), orphans)
+	}
+	if orphans[0].TaskID != "GH-257" || orphans[0].ExecutionID != "" {
+		t.Errorf("unexpected reaped claim: %+v", orphans[0])
+	}
+}
+
 // TestRepickBackoff_PersistsAcrossStoreReopen is the GH-4394 regression test:
 // the whole point of persisting repick-backoff state (rather than keeping it
 // purely in-process, as it was under #4385) is that a fresh Store handle —
@@ -1664,6 +1951,185 @@ func TestGetExecutionsInPeriod(t *testing.T) {
 				t.Errorf("got %d executions, want at least %d", len(results), tt.wantMin)
 			}
 		})
+	}
+}
+
+// TestGetExecutionsForReceipts covers GH-5257's receipts digest query:
+// full column completeness (cost/diff-size/source-issue fields), terminal
+// status filtering, canary exclusion, and period boundaries.
+// TestGetExecutionsForReceipts is GH-5261 (PR#5258 review): the receipts
+// digest window is keyed on completed_at, not created_at, so an in-flight
+// run at digest time still gets receipted once it finishes.
+func TestGetExecutionsForReceipts(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// GH-5308: normalized to UTC. Production never writes completed_at as a
+	// local-offset Go time — every real UPDATE sets it via CURRENT_TIMESTAMP
+	// (SQLite's own UTC, offset-less text) — so this test seeds it the same
+	// way GetExecutionsForReceipts's own query.Start/End are now normalized,
+	// instead of leaking the test host's local zone into stored data.
+	now := time.Now().UTC()
+	inWindow := now
+	outOfWindow := now.Add(-48 * time.Hour)
+
+	execs := []*Execution{
+		{
+			ID: "receipt-completed", TaskID: "GH-5214", ProjectPath: "/p", Status: "completed",
+			CreatedAt: now, CompletedAt: &inWindow, DurationMs: 840000, EstimatedCostUSD: 2.75,
+			FilesChanged: 4, LinesAdded: 88, LinesRemoved: 15,
+			TaskSourceAdapter: "github", TaskSourceIssueID: "5214",
+		},
+		{
+			ID: "receipt-failed", TaskID: "GH-5215", ProjectPath: "/p", Status: "failed",
+			CreatedAt: now, CompletedAt: &inWindow, DurationMs: 30000, EstimatedCostUSD: 0.42,
+			FilesChanged: 1, LinesAdded: 3, LinesRemoved: 1,
+			TaskSourceAdapter: "github", TaskSourceIssueID: "5215",
+		},
+		{
+			// Non-terminal (no CompletedAt yet): must be excluded.
+			ID: "receipt-running", TaskID: "GH-5216", ProjectPath: "/p", Status: "running",
+			CreatedAt: now, EstimatedCostUSD: 0.10,
+		},
+		{
+			// Canary: must be excluded even though terminal and in-period.
+			ID: "receipt-canary", TaskID: "GH-5217", ProjectPath: "/p", Status: "completed",
+			CreatedAt: now, CompletedAt: &inWindow, EstimatedCostUSD: 1.00, IsCanary: true,
+		},
+		{
+			// Completed outside the period: must be excluded.
+			ID: "receipt-yesterday", TaskID: "GH-5218", ProjectPath: "/p", Status: "completed",
+			CreatedAt: outOfWindow, CompletedAt: &outOfWindow, EstimatedCostUSD: 5.00,
+		},
+		{
+			// GH-5261: created well before the window opened (e.g. started
+			// before the previous digest ran) but finished inside the
+			// window — must be included. This is the "in-flight at digest
+			// time" case the created_at-keyed window used to drop forever.
+			ID: "receipt-in-flight-at-digest", TaskID: "GH-5219", ProjectPath: "/p", Status: "completed",
+			CreatedAt: outOfWindow, CompletedAt: &inWindow, EstimatedCostUSD: 3.30,
+			LinesAdded: 20, LinesRemoved: 5,
+			TaskSourceAdapter: "github", TaskSourceIssueID: "5219",
+		},
+	}
+	for _, e := range execs {
+		if err := store.SaveExecution(e); err != nil {
+			t.Fatalf("SaveExecution %s: %v", e.ID, err)
+		}
+	}
+
+	query := BriefQuery{
+		Start: now.Add(-1 * time.Hour),
+		End:   now.Add(1 * time.Hour),
+	}
+
+	rows, err := store.GetExecutionsForReceipts(query)
+	if err != nil {
+		t.Fatalf("GetExecutionsForReceipts: %v", err)
+	}
+
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows (completed + failed + in-flight-at-digest, excluding running/canary/out-of-period), got %d", len(rows))
+	}
+
+	byID := map[string]*Execution{}
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+
+	if _, ok := byID["receipt-running"]; ok {
+		t.Error("expected running execution to be excluded")
+	}
+	if _, ok := byID["receipt-canary"]; ok {
+		t.Error("expected canary execution to be excluded")
+	}
+	if _, ok := byID["receipt-yesterday"]; ok {
+		t.Error("expected out-of-period execution to be excluded")
+	}
+
+	completed, ok := byID["receipt-completed"]
+	if !ok {
+		t.Fatal("expected receipt-completed row")
+	}
+	if completed.EstimatedCostUSD != 2.75 {
+		t.Errorf("EstimatedCostUSD = %v, want 2.75", completed.EstimatedCostUSD)
+	}
+	if completed.LinesAdded != 88 || completed.LinesRemoved != 15 {
+		t.Errorf("LinesAdded/LinesRemoved = %d/%d, want 88/15", completed.LinesAdded, completed.LinesRemoved)
+	}
+	if completed.FilesChanged != 4 {
+		t.Errorf("FilesChanged = %d, want 4", completed.FilesChanged)
+	}
+	if completed.TaskSourceAdapter != "github" || completed.TaskSourceIssueID != "5214" {
+		t.Errorf("TaskSourceAdapter/TaskSourceIssueID = %q/%q, want github/5214", completed.TaskSourceAdapter, completed.TaskSourceIssueID)
+	}
+
+	failed, ok := byID["receipt-failed"]
+	if !ok {
+		t.Fatal("expected receipt-failed row")
+	}
+	if failed.Status != "failed" {
+		t.Errorf("Status = %q, want failed", failed.Status)
+	}
+	if failed.EstimatedCostUSD != 0.42 {
+		t.Errorf("EstimatedCostUSD = %v, want 0.42 (failed runs still cost money)", failed.EstimatedCostUSD)
+	}
+
+	inFlight, ok := byID["receipt-in-flight-at-digest"]
+	if !ok {
+		t.Fatal("expected receipt-in-flight-at-digest row (created before window, completed inside it)")
+	}
+	if inFlight.EstimatedCostUSD != 3.30 {
+		t.Errorf("EstimatedCostUSD = %v, want 3.30", inFlight.EstimatedCostUSD)
+	}
+}
+
+// TestGetExecutionsForReceipts_NonUTCHost is GH-5308's regression case for
+// the receipts digest specifically: completed_at is set by UpdateExecutionStatus
+// via `completed_at = CURRENT_TIMESTAMP` (unlike TestGetExecutionsForReceipts
+// above, which sets it directly through SaveExecution's Go-bound insert path
+// and so never touches CURRENT_TIMESTAMP's UTC, offset-less text layout at
+// all). ReceiptsScheduler.runDigest builds its BriefQuery.Start/End with
+// time.Now().In(loc) using the digest's configured Timezone (default
+// "America/New_York", i.e. never UTC) — the exact same Go-local-vs-DB-UTC
+// mismatch ReapOrphanedClaims had. This forces a fixed non-UTC time.Local so
+// the mismatch reproduces deterministically regardless of the host running
+// the test, and pins GetExecutionsForReceipts's own query.Start.UTC()/
+// query.End.UTC() fix.
+func TestGetExecutionsForReceipts_NonUTCHost(t *testing.T) {
+	withFixedLocalOffset(t, 2)
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	if err := store.SaveExecution(&Execution{
+		ID: "receipt-nonutc-completed", TaskID: "GH-5308", ProjectPath: "/p", Status: "running",
+		EstimatedCostUSD: 1.50,
+	}); err != nil {
+		t.Fatalf("SaveExecution: %v", err)
+	}
+	// Drive completed_at through the real production path (CURRENT_TIMESTAMP),
+	// not a Go-bound param, so this reproduces the actual stored text layout.
+	if err := store.UpdateExecutionStatus("receipt-nonutc-completed", "completed"); err != nil {
+		t.Fatalf("UpdateExecutionStatus: %v", err)
+	}
+
+	now := time.Now() // local, offset by withFixedLocalOffset above
+	rows, err := store.GetExecutionsForReceipts(BriefQuery{
+		Start: now.Add(-1 * time.Hour),
+		End:   now.Add(1 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("GetExecutionsForReceipts: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != "receipt-nonutc-completed" {
+		t.Fatalf("expected the just-completed execution to fall inside a +/-1h window under a non-UTC time.Local, got %d rows: %+v", len(rows), rows)
 	}
 }
 
@@ -2790,15 +3256,17 @@ func TestBriefHistory(t *testing.T) {
 		name          string
 		setup         func(*Store)
 		channel       string
+		queryType     string
 		wantNil       bool
 		wantBriefType string
 		wantRecipient string
 	}{
 		{
-			name:    "empty table returns nil",
-			setup:   func(s *Store) {},
-			channel: "telegram",
-			wantNil: true,
+			name:      "empty table returns nil",
+			setup:     func(s *Store) {},
+			channel:   "telegram",
+			queryType: "daily",
+			wantNil:   true,
 		},
 		{
 			name: "single insert returns that record",
@@ -2811,6 +3279,7 @@ func TestBriefHistory(t *testing.T) {
 				})
 			},
 			channel:       "telegram",
+			queryType:     "daily",
 			wantNil:       false,
 			wantBriefType: "daily",
 			wantRecipient: "user123",
@@ -2825,7 +3294,8 @@ func TestBriefHistory(t *testing.T) {
 					BriefType: "daily",
 					Recipient: "old-user",
 				})
-				// Insert newer record
+				// Insert newer record of a different brief type — must not
+				// be picked up by a "daily" query (GH-5257).
 				_ = s.RecordBriefSent(&BriefRecord{
 					SentAt:    time.Now().Add(-1 * time.Hour),
 					Channel:   "slack",
@@ -2841,6 +3311,7 @@ func TestBriefHistory(t *testing.T) {
 				})
 			},
 			channel:       "slack",
+			queryType:     "daily",
 			wantNil:       false,
 			wantBriefType: "daily",
 			wantRecipient: "latest-user",
@@ -2862,6 +3333,7 @@ func TestBriefHistory(t *testing.T) {
 				})
 			},
 			channel:       "telegram",
+			queryType:     "daily",
 			wantNil:       false,
 			wantBriefType: "daily",
 			wantRecipient: "tg-user",
@@ -2875,8 +3347,58 @@ func TestBriefHistory(t *testing.T) {
 					BriefType: "daily",
 				})
 			},
-			channel: "email",
-			wantNil: true,
+			channel:   "email",
+			queryType: "daily",
+			wantNil:   true,
+		},
+		{
+			// GH-5257: two brief types sharing a channel must not
+			// cross-contaminate — a "receipts" digest sent more recently on
+			// the same Telegram channel must not shadow the "daily" brief's
+			// own last-sent record (and vice versa), or catch-up logic for
+			// one brief type would fire/skip based on the other's history.
+			name: "filters by brief_type on shared channel",
+			setup: func(s *Store) {
+				_ = s.RecordBriefSent(&BriefRecord{
+					SentAt:    time.Now().Add(-1 * time.Hour),
+					Channel:   "telegram",
+					BriefType: "daily",
+					Recipient: "daily-recipient",
+				})
+				_ = s.RecordBriefSent(&BriefRecord{
+					SentAt:    time.Now(),
+					Channel:   "telegram",
+					BriefType: "receipts",
+					Recipient: "receipts-recipient",
+				})
+			},
+			channel:       "telegram",
+			queryType:     "daily",
+			wantNil:       false,
+			wantBriefType: "daily",
+			wantRecipient: "daily-recipient",
+		},
+		{
+			name: "reads its own type when the other type is older",
+			setup: func(s *Store) {
+				_ = s.RecordBriefSent(&BriefRecord{
+					SentAt:    time.Now().Add(-1 * time.Hour),
+					Channel:   "telegram",
+					BriefType: "daily",
+					Recipient: "daily-recipient",
+				})
+				_ = s.RecordBriefSent(&BriefRecord{
+					SentAt:    time.Now(),
+					Channel:   "telegram",
+					BriefType: "receipts",
+					Recipient: "receipts-recipient",
+				})
+			},
+			channel:       "telegram",
+			queryType:     "receipts",
+			wantNil:       false,
+			wantBriefType: "receipts",
+			wantRecipient: "receipts-recipient",
 		},
 	}
 
@@ -2891,7 +3413,7 @@ func TestBriefHistory(t *testing.T) {
 
 			tt.setup(store)
 
-			record, err := store.GetLastBriefSent(tt.channel)
+			record, err := store.GetLastBriefSent(tt.channel, tt.queryType)
 			if err != nil {
 				t.Fatalf("GetLastBriefSent: %v", err)
 			}
@@ -4808,8 +5330,13 @@ func TestPruneExecutionLogs(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	old := time.Now().Add(-2 * time.Hour)
-	recent := time.Now().Add(-10 * time.Minute)
+	// GH-5310: execution_logs.timestamp is always written in UTC (SaveLogEntry
+	// normalizes it at bind time), so these direct inserts — which bypass
+	// SaveLogEntry — must normalize to UTC too, or they simulate a row shape
+	// production can no longer produce and the comparison against
+	// PruneExecutionLogs's UTC cutoff can misjudge on a non-UTC test host.
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	recent := time.Now().Add(-10 * time.Minute).UTC()
 
 	// Insert two old entries and one recent entry directly.
 	_, err = store.db.Exec(`INSERT INTO execution_logs (timestamp, level, message, component) VALUES (?, 'info', 'old1', 'test')`, old)
@@ -6271,5 +6798,137 @@ func TestReclassifySupersededForRearm_DemotesToFailedAndUnblocksRetry(t *testing
 	}
 	if otherExec.Status != "superseded" {
 		t.Errorf("expected the other task's superseded row to remain untouched, got status %q", otherExec.Status)
+	}
+}
+
+// TestGH5310_UTCTimestamps_NonUTCHost is GH-5310's follow-up to the GH-5308
+// reaper/receipts fix: every Go-written DB timestamp in this package must be
+// stamped in UTC, not just the two sites #5309 fixed. Before this fix,
+// executions.created_at (SaveExecution's Go-side fallback and caller-supplied
+// paths), the BriefQuery/since bounds compared against it, execution_logs.timestamp,
+// and autopilot_metrics.snapshot_at were all bound in whatever zone
+// time.Local happened to be — while completed_at (via CURRENT_TIMESTAMP) was
+// always UTC. On a UTC host (CI, the founder box) that mismatch is invisible:
+// local time.Now() and its .UTC() equivalent format identically. Table-driven
+// across a positive (+2) and a negative (-7) offset so the fix isn't pinned
+// to only one side of UTC.
+func TestGH5310_UTCTimestamps_NonUTCHost(t *testing.T) {
+	for _, offset := range []int{2, -7} {
+		t.Run(fmt.Sprintf("offset=%+d", offset), func(t *testing.T) {
+			withFixedLocalOffset(t, offset)
+
+			store, err := NewStore(t.TempDir())
+			if err != nil {
+				t.Fatalf("NewStore: %v", err)
+			}
+			defer func() { _ = store.Close() }()
+
+			now := time.Now() // local, offset by withFixedLocalOffset above
+			completedAt := now
+
+			// SaveExecution: CreatedAt left zero (exercises the Go time.Now()
+			// fallback) and a caller-supplied local CompletedAt — both must
+			// land on disk normalized to UTC.
+			if err := store.SaveExecution(&Execution{
+				ID: "gh5310-exec", TaskID: "GH-5310", ProjectPath: "/p",
+				Status: "completed", CompletedAt: &completedAt, EstimatedCostUSD: 1.00,
+			}); err != nil {
+				t.Fatalf("SaveExecution: %v", err)
+			}
+
+			// GetExecutionsInPeriod: a +/-1h window around "now" must find the
+			// just-written row.
+			periodRows, err := store.GetExecutionsInPeriod(BriefQuery{
+				Start: now.Add(-1 * time.Hour), End: now.Add(1 * time.Hour),
+			})
+			if err != nil {
+				t.Fatalf("GetExecutionsInPeriod: %v", err)
+			}
+			if len(periodRows) != 1 || periodRows[0].ID != "gh5310-exec" {
+				t.Fatalf("GetExecutionsInPeriod: expected the just-written row inside a +/-1h window, got %d rows: %+v", len(periodRows), periodRows)
+			}
+
+			// GetBriefMetrics: same window must count it.
+			metrics, err := store.GetBriefMetrics(BriefQuery{
+				Start: now.Add(-1 * time.Hour), End: now.Add(1 * time.Hour),
+			})
+			if err != nil {
+				t.Fatalf("GetBriefMetrics: %v", err)
+			}
+			if metrics.TotalTasks != 1 {
+				t.Errorf("GetBriefMetrics: TotalTasks = %d, want 1", metrics.TotalTasks)
+			}
+
+			// GetWindowedStats: since = now - 1h must include it.
+			ws, err := store.GetWindowedStats("", now.Add(-1*time.Hour))
+			if err != nil {
+				t.Fatalf("GetWindowedStats: %v", err)
+			}
+			if ws.AttemptTotal != 1 {
+				t.Errorf("GetWindowedStats: AttemptTotal = %d, want 1", ws.AttemptTotal)
+			}
+
+			// Read-back: created_at and completed_at on this one row must be
+			// within seconds of each other. Pre-fix, created_at was stamped in
+			// the fixed-offset local zone while completed_at came from a
+			// caller-supplied local value too — normalizing only one side (as
+			// #5309 did for the two known sites) leaves this row's own two
+			// columns offset from each other by the full zone difference.
+			exec, err := store.GetExecution("gh5310-exec")
+			if err != nil {
+				t.Fatalf("GetExecution: %v", err)
+			}
+			if exec.CompletedAt == nil {
+				t.Fatal("expected CompletedAt to be set")
+			}
+			if d := exec.CompletedAt.Sub(exec.CreatedAt); d < -5*time.Second || d > 5*time.Second {
+				t.Errorf("created_at and completed_at differ by %v, want within a few seconds (offset=%+d)", d, offset)
+			}
+
+			// Log cleanup: a fresh entry must survive a 1h prune; a 2h-old one
+			// must not.
+			if err := store.SaveLogEntry(&LogEntry{ExecutionID: "gh5310-exec", Timestamp: now, Level: "info", Message: "fresh", Component: "test"}); err != nil {
+				t.Fatalf("SaveLogEntry (fresh): %v", err)
+			}
+			if err := store.SaveLogEntry(&LogEntry{ExecutionID: "gh5310-exec", Timestamp: now.Add(-2 * time.Hour), Level: "info", Message: "old", Component: "test"}); err != nil {
+				t.Fatalf("SaveLogEntry (old): %v", err)
+			}
+			deletedLogs, err := store.PruneExecutionLogs(time.Hour)
+			if err != nil {
+				t.Fatalf("PruneExecutionLogs: %v", err)
+			}
+			if deletedLogs != 1 {
+				t.Errorf("PruneExecutionLogs: deleted = %d, want 1 (only the 2h-old entry)", deletedLogs)
+			}
+			var remainingLogs int
+			if err := store.db.QueryRow(`SELECT COUNT(*) FROM execution_logs`).Scan(&remainingLogs); err != nil {
+				t.Fatalf("count execution_logs: %v", err)
+			}
+			if remainingLogs != 1 {
+				t.Errorf("remaining execution_logs = %d, want 1 (the fresh entry)", remainingLogs)
+			}
+
+			// Metrics cleanup: same shape, autopilot_metrics.snapshot_at.
+			if err := store.SaveAutopilotMetrics(&AutopilotMetricsRow{SnapshotAt: now}); err != nil {
+				t.Fatalf("SaveAutopilotMetrics (fresh): %v", err)
+			}
+			if err := store.SaveAutopilotMetrics(&AutopilotMetricsRow{SnapshotAt: now.Add(-2 * time.Hour)}); err != nil {
+				t.Fatalf("SaveAutopilotMetrics (old): %v", err)
+			}
+			deletedMetrics, err := store.PruneAutopilotMetrics(time.Hour)
+			if err != nil {
+				t.Fatalf("PruneAutopilotMetrics: %v", err)
+			}
+			if deletedMetrics != 1 {
+				t.Errorf("PruneAutopilotMetrics: deleted = %d, want 1 (only the 2h-old snapshot)", deletedMetrics)
+			}
+			var remainingMetrics int
+			if err := store.db.QueryRow(`SELECT COUNT(*) FROM autopilot_metrics`).Scan(&remainingMetrics); err != nil {
+				t.Fatalf("count autopilot_metrics: %v", err)
+			}
+			if remainingMetrics != 1 {
+				t.Errorf("remaining autopilot_metrics = %d, want 1 (the fresh snapshot)", remainingMetrics)
+			}
+		})
 	}
 }
